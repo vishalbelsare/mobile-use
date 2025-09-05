@@ -30,6 +30,10 @@
       "outputter": {
         "provider": "openai",
         "model": "gpt-5-nano"
+      },
+      "spectron": {
+        "provider": "openai",
+        "model": "gpt-5-nano"
       }
     }
   },
@@ -63,6 +67,10 @@
         "model": "gpt-4.1"
       },
       "outputter": {
+        "provider": "openai",
+        "model": "gpt-5-nano"
+      },
+      "spectron": {
         "provider": "openai",
         "model": "gpt-5-nano"
       }

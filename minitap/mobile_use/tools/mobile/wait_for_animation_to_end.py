@@ -1,8 +1,11 @@
+from typing import Annotated
+
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
 from langchain_core.tools.base import InjectedToolCallId
 from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
+
 from minitap.mobile_use.constants import EXECUTOR_MESSAGES_KEY
 from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.controllers.mobile_command_controller import WaitTimeout
@@ -11,7 +14,6 @@ from minitap.mobile_use.controllers.mobile_command_controller import (
 )
 from minitap.mobile_use.graph.state import State
 from minitap.mobile_use.tools.tool_wrapper import ToolWrapper
-from typing import Annotated
 
 
 def get_wait_for_animation_to_end_tool(ctx: MobileUseContext):
@@ -39,7 +41,7 @@ def get_wait_for_animation_to_end_tool(ctx: MobileUseContext):
             tool_call_id=tool_call_id,
             content=wait_for_animation_to_end_wrapper.on_failure_fn()
             if has_failed
-            else wait_for_animation_to_end_wrapper.on_success_fn(timeout),
+            else wait_for_animation_to_end_wrapper.on_success_fn(),
             additional_kwargs={"error": output} if has_failed else {},
             status="error" if has_failed else "success",
         )

@@ -91,7 +91,7 @@ def record_events(output_path: Path | None, events: list[str] | BaseModel | Any)
 ### LLM Configuration
 
 LLMProvider = Literal["openai", "google", "openrouter", "xai", "vertexai"]
-LLMUtilsNode = Literal["outputter", "hopper"]
+LLMUtilsNode = Literal["outputter", "hopper", "spectron"]
 AgentNode = Literal["planner", "orchestrator", "cortex", "executor"]
 AgentNodeWithFallback = Literal["cortex"]
 
@@ -146,6 +146,7 @@ class LLMWithFallback(LLM):
 class LLMConfigUtils(BaseModel):
     outputter: LLM
     hopper: LLM
+    spectron: LLM
 
 
 class LLMConfig(BaseModel):
@@ -172,6 +173,7 @@ class LLMConfig(BaseModel):
 🧩 Utils:
     🔽 Hopper: {self.utils.hopper}
     📝 Outputter: {self.utils.outputter}
+    📸 Spectron: {self.utils.spectron}
 """
 
     def get_agent(self, item: AgentNode) -> LLM:
@@ -202,6 +204,7 @@ def get_default_llm_config() -> LLMConfig:
             utils=LLMConfigUtils(
                 outputter=LLM(provider="openai", model="gpt-5-nano"),
                 hopper=LLM(provider="openai", model="gpt-4.1"),
+                spectron=LLM(provider="openai", model="gpt-5-nano"),
             ),
         )
 
