@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from minitap.mobile_use.utils.logger import get_logger
 
@@ -40,7 +40,10 @@ def text_input_is_empty(text: str | None, hint_text: str | None) -> bool:
 
 
 def find_element_by_resource_id(
-    ui_hierarchy: list[dict], resource_id: str, is_rich_hierarchy: bool = False
+    ui_hierarchy: list[dict],
+    resource_id: str,
+    index: int | None = None,
+    is_rich_hierarchy: bool = False,
 ) -> dict | None:
     """
     Find a UI element by its resource-id in the UI hierarchy.
@@ -60,7 +63,11 @@ def find_element_by_resource_id(
         for element in elements:
             if isinstance(element, dict):
                 if element.get("resourceId") == resource_id:
-                    return element
+                    idx = index or 0
+                    if idx == 0:
+                        return element
+                    idx -= 1
+                    continue
 
                 children = element.get("children", [])
                 if children:
@@ -88,10 +95,10 @@ class Point(BaseModel):
 
 
 class ElementBounds(BaseModel):
-    x: int
-    y: int
-    width: int
-    height: int
+    x: int = Field(description="The x coordinate of the top-left corner of the element.")
+    y: int = Field(description="The y coordinate of the top-left corner of the element.")
+    width: int = Field(description="The width of the element.")
+    height: int = Field(description="The height of the element.")
 
     def get_center(self) -> Point:
         return Point(x=self.x + self.width // 2, y=self.y + self.height // 2)
@@ -109,8 +116,8 @@ class ElementBounds(BaseModel):
         <------>
         """
         return Point(
-            x=int((self.x + self.width) * x_percent),
-            y=int((self.y + self.height) * y_percent),
+            x=int(self.x + self.width * x_percent),
+            y=int(self.y + self.height * y_percent),
         )
 
 

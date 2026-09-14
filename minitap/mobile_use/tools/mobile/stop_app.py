@@ -1,43 +1,51 @@
+from typing import Annotated
+
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
 from langchain_core.tools.base import InjectedToolCallId
 from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
+
 from minitap.mobile_use.constants import EXECUTOR_MESSAGES_KEY
 from minitap.mobile_use.context import MobileUseContext
-from minitap.mobile_use.controllers.mobile_command_controller import stop_app as stop_app_controller
+from minitap.mobile_use.controllers.unified_controller import UnifiedMobileController
 from minitap.mobile_use.graph.state import State
 from minitap.mobile_use.tools.tool_wrapper import ToolWrapper
-from typing import Annotated
 
 
 def get_stop_app_tool(ctx: MobileUseContext):
     @tool
-    def stop_app(
-        tool_call_id: Annotated[str, InjectedToolCallId],
-        state: Annotated[State, InjectedState],
+    async def stop_app(
         agent_thought: str,
         package_name: str | None = None,
-    ):
+        tool_call_id: Annotated[str, InjectedToolCallId] = None,  # type: ignore
+        state: Annotated[State, InjectedState] = None,  # type: ignore
+    ) -> Command:
         """
         Stops current application if it is running.
         You can also specify the package name of the app to be stopped.
         """
-        output = stop_app_controller(ctx=ctx, package_name=package_name)
-        has_failed = output is not None
+        controller = UnifiedMobileController(ctx)
+        success = await controller.terminate_app(package_name)
+        has_failed = not success
+        output = "Failed to terminate app" if has_failed else None
+
+        agent_outcome = (
+            stop_app_wrapper.on_failure_fn(package_name)
+            if has_failed
+            else stop_app_wrapper.on_success_fn(package_name)
+        )
         tool_message = ToolMessage(
             tool_call_id=tool_call_id,
-            content=stop_app_wrapper.on_failure_fn(package_name)
-            if has_failed
-            else stop_app_wrapper.on_success_fn(package_name),
+            content=agent_outcome,
             additional_kwargs={"error": output} if has_failed else {},
             status="error" if has_failed else "success",
         )
         return Command(
-            update=state.sanitize_update(
+            update=await state.asanitize_update(
                 ctx=ctx,
                 update={
-                    "agents_thoughts": [agent_thought],
+                    "agents_thoughts": [agent_thought, agent_outcome],
                     EXECUTOR_MESSAGES_KEY: [tool_message],
                 },
                 agent="executor",

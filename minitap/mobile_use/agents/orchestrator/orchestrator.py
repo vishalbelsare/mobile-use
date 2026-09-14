@@ -15,7 +15,7 @@ from minitap.mobile_use.agents.planner.utils import (
 )
 from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.graph.state import State
-from minitap.mobile_use.services.llm import get_llm
+from minitap.mobile_use.services.llm import get_llm, invoke_llm_with_timeout_message, with_fallback
 from minitap.mobile_use.utils.decorators import wrap_with_callbacks
 from minitap.mobile_use.utils.logger import get_logger
 
@@ -45,14 +45,18 @@ class OrchestratorNode:
                     else f"Starting the next subgoal: {new_subgoal}"
                 )
             ]
-            return _get_state_update(ctx=self.ctx, state=state, thoughts=thoughts, update_plan=True)
+            return await _get_state_update(
+                ctx=self.ctx, state=state, thoughts=thoughts, update_plan=True
+            )
 
         subgoals_to_examine = get_subgoals_by_ids(
             subgoals=state.subgoal_plan,
             ids=state.complete_subgoals_by_ids,
         )
         if len(subgoals_to_examine) <= 0:
-            return _get_state_update(ctx=self.ctx, state=state, thoughts=["No subgoal to examine."])
+            return await _get_state_update(
+                ctx=self.ctx, state=state, thoughts=["No subgoal to examine."]
+            )
 
         system_message = Template(
             Path(__file__).parent.joinpath("orchestrator.md").read_text(encoding="utf-8")
@@ -70,15 +74,23 @@ class OrchestratorNode:
             HumanMessage(content=human_message),
         ]
 
-        llm = get_llm(ctx=self.ctx, name="orchestrator", temperature=1)
-        llm = llm.with_structured_output(OrchestratorOutput)
-        response: OrchestratorOutput = await llm.ainvoke(messages)  # type: ignore
-
+        llm = get_llm(ctx=self.ctx, name="orchestrator", temperature=1).with_structured_output(
+            OrchestratorOutput
+        )
+        llm_fallback = get_llm(
+            ctx=self.ctx, name="orchestrator", use_fallback=True, temperature=1
+        ).with_structured_output(OrchestratorOutput)
+        response: OrchestratorOutput = await with_fallback(
+            main_call=lambda: invoke_llm_with_timeout_message(llm.ainvoke(messages)),
+            fallback_call=lambda: invoke_llm_with_timeout_message(llm_fallback.ainvoke(messages)),
+        )  # type: ignore
         if response.needs_replaning:
             thoughts = [response.reason]
             state.subgoal_plan = fail_current_subgoal(state.subgoal_plan)
             thoughts.append("==== END OF PLAN, REPLANNING ====")
-            return _get_state_update(ctx=self.ctx, state=state, thoughts=thoughts, update_plan=True)
+            return await _get_state_update(
+                ctx=self.ctx, state=state, thoughts=thoughts, update_plan=True
+            )
 
         state.subgoal_plan = complete_subgoals_by_ids(
             subgoals=state.subgoal_plan,
@@ -87,19 +99,25 @@ class OrchestratorNode:
         thoughts = [response.reason]
         if all_completed(state.subgoal_plan):
             logger.success("All the subgoals have been completed successfully.")
-            return _get_state_update(ctx=self.ctx, state=state, thoughts=thoughts, update_plan=True)
+            return await _get_state_update(
+                ctx=self.ctx, state=state, thoughts=thoughts, update_plan=True
+            )
 
         if current_subgoal.id not in response.completed_subgoal_ids:
             # The current subgoal is not yet complete.
-            return _get_state_update(ctx=self.ctx, state=state, thoughts=thoughts, update_plan=True)
+            return await _get_state_update(
+                ctx=self.ctx, state=state, thoughts=thoughts, update_plan=True
+            )
 
         state.subgoal_plan = start_next_subgoal(state.subgoal_plan)
         new_subgoal = get_current_subgoal(state.subgoal_plan)
         thoughts.append(f"==== NEXT SUBGOAL: {new_subgoal} ====")
-        return _get_state_update(ctx=self.ctx, state=state, thoughts=thoughts, update_plan=True)
+        return await _get_state_update(
+            ctx=self.ctx, state=state, thoughts=thoughts, update_plan=True
+        )
 
 
-def _get_state_update(
+async def _get_state_update(
     ctx: MobileUseContext,
     state: State,
     thoughts: list[str],
@@ -111,4 +129,6 @@ def _get_state_update(
     }
     if update_plan:
         update["subgoal_plan"] = state.subgoal_plan
-    return state.sanitize_update(ctx=ctx, update=update, agent="orchestrator")
+        if ctx.on_plan_changes:
+            await ctx.on_plan_changes(state.subgoal_plan, False)
+    return await state.asanitize_update(ctx=ctx, update=update, agent="orchestrator")

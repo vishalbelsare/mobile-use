@@ -1,22 +1,104 @@
+import asyncio
 import logging
-from collections.abc import Awaitable, Callable
-from typing import Literal, TypeVar, overload
+from collections.abc import Awaitable, Callable, Coroutine
+from typing import Any, Literal, TypeVar, overload
 
+from langchain_anthropic import ChatAnthropic
 from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_azure_ai.chat_models import AzureAIOpenAIApiChatModel
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_google_vertexai import ChatVertexAI
 from langchain_openai import ChatOpenAI
+from pydantic import SecretStr
 
 from minitap.mobile_use.config import (
     AgentNode,
     AgentNodeWithFallback,
     LLMUtilsNode,
+    LLMUtilsNodeWithFallback,
     LLMWithFallback,
     settings,
 )
 from minitap.mobile_use.context import MobileUseContext
+from minitap.mobile_use.utils.logger import get_logger
 
-logger = logging.getLogger(__name__)
+# Logger for internal messages (ex: fallback)
+llm_logger = logging.getLogger(__name__)
+# Logger for user messages
+user_messages_logger = get_logger(__name__)
+
+
+async def invoke_llm_with_timeout_message[T](
+    llm_call: Coroutine[Any, Any, T],
+    timeout_seconds: int = 10,
+) -> T:
+    """
+    Send a LLM call and display a timeout message if it takes too long.
+
+    Args:
+        llm_call: The coroutine of the LLM call to execute.
+        timeout_seconds: The delay in seconds before displaying the message.
+
+    Returns:
+        The result of the LLM call.
+    """
+    llm_task = asyncio.create_task(llm_call)
+    waiter_task = asyncio.create_task(asyncio.sleep(timeout_seconds))
+
+    done, _ = await asyncio.wait({llm_task, waiter_task}, return_when=asyncio.FIRST_COMPLETED)
+
+    if llm_task in done:
+        # The LLM call has finished before the timeout, cancel the timer
+        waiter_task.cancel()
+        return llm_task.result()
+    else:
+        # The timeout has been reached, display the message and wait for the call to finish
+        user_messages_logger.info("Waiting for LLM call response...")
+        return await llm_task
+
+
+def _build_custom_headers(agent_name: str | None = None) -> dict[str, str]:
+    """Build custom headers for LLM API calls."""
+    headers: dict[str, str] = {}
+    if agent_name:
+        headers["X-Agent-Name"] = agent_name
+    if settings.PROJECT_NAME:
+        headers["X-Project-Name"] = settings.PROJECT_NAME
+    return headers
+
+
+def get_minitap_llm(
+    trace_id: str,
+    model: str = "google/gemini-2.5-pro",
+    temperature: float | None = None,
+    max_retries: int | None = None,
+    api_key: str | None = None,
+    agent_name: str | None = None,
+) -> ChatOpenAI:
+    if api_key:
+        effective_api_key = SecretStr(api_key)
+    elif settings.MINITAP_API_KEY:
+        effective_api_key = settings.MINITAP_API_KEY
+    else:
+        raise ValueError("MINITAP_API_KEY must be provided or set in environment")
+
+    if max_retries is None and model.startswith("google/"):
+        max_retries = 2
+
+    custom_headers = _build_custom_headers(agent_name)
+
+    client = ChatOpenAI(
+        model=model,
+        temperature=temperature,
+        max_retries=max_retries,
+        api_key=effective_api_key,
+        base_url=settings.MINITAP_API_BASE_URL,
+        default_query={
+            "sessionId": trace_id,
+        },
+        default_headers=custom_headers or None,
+    )
+    return client
 
 
 def get_google_llm(
@@ -43,6 +125,23 @@ def get_vertex_llm(
         max_tokens=None,
         temperature=temperature,
         max_retries=2,
+    )
+    return client
+
+
+def get_anthropic_llm(
+    model_name: str = "claude-sonnet-4-6",
+    temperature: float = 1,
+) -> ChatAnthropic:
+    assert settings.ANTHROPIC_API_KEY is not None
+    client = ChatAnthropic(
+        model_name=model_name,
+        api_key=settings.ANTHROPIC_API_KEY,
+        temperature=temperature,
+        max_tokens=8192,  # type: ignore[call-arg]  # field aliased to max_tokens_to_sample
+        max_retries=2,
+        timeout=None,
+        stop=None,
     )
     return client
 
@@ -83,6 +182,44 @@ def get_grok_llm(model_name: str, temperature: float = 1) -> ChatOpenAI:
     return client
 
 
+def get_azure_llm(model_name: str, temperature: float = 1) -> AzureAIOpenAIApiChatModel:
+    assert settings.AZURE_BASE_URL is not None
+
+    api_key: str | None = None
+    if settings.AZURE_API_KEY:
+        api_key = settings.AZURE_API_KEY.get_secret_value()
+
+    if api_key:
+        client = AzureAIOpenAIApiChatModel(
+            model=model_name,
+            endpoint=settings.AZURE_BASE_URL,
+            credential=api_key,
+            temperature=temperature,
+        )
+    else:
+        from azure.identity import DefaultAzureCredential
+
+        client = AzureAIOpenAIApiChatModel(
+            model=model_name,
+            project_endpoint=settings.AZURE_BASE_URL,
+            credential=DefaultAzureCredential(),
+            temperature=temperature,
+        )
+    return client
+
+
+def get_minimax_llm(model_name: str = "MiniMax-M2.7", temperature: float = 1) -> ChatOpenAI:
+    assert settings.MINIMAX_API_KEY is not None
+    clamped_temperature = max(0.0, min(1.0, temperature))
+    client = ChatOpenAI(
+        model=model_name,
+        api_key=settings.MINIMAX_API_KEY,
+        temperature=clamped_temperature,
+        base_url="https://api.minimax.io/v1",
+    )
+    return client
+
+
 @overload
 def get_llm(
     ctx: MobileUseContext,
@@ -96,8 +233,9 @@ def get_llm(
 @overload
 def get_llm(
     ctx: MobileUseContext,
-    name: AgentNode,
+    name: LLMUtilsNode,
     *,
+    is_utils: Literal[True],
     temperature: float = 1,
 ) -> BaseChatModel: ...
 
@@ -105,9 +243,10 @@ def get_llm(
 @overload
 def get_llm(
     ctx: MobileUseContext,
-    name: LLMUtilsNode,
+    name: LLMUtilsNodeWithFallback,
     *,
     is_utils: Literal[True],
+    use_fallback: bool = False,
     temperature: float = 1,
 ) -> BaseChatModel: ...
 
@@ -129,7 +268,9 @@ def get_llm(
             llm = llm.fallback
         else:
             raise ValueError("LLM has no fallback!")
-    if llm.provider == "openai":
+    if llm.provider == "anthropic":
+        return get_anthropic_llm(llm.model, temperature)
+    elif llm.provider == "openai":
         return get_openai_llm(llm.model, temperature)
     elif llm.provider == "google":
         return get_google_llm(llm.model, temperature)
@@ -139,6 +280,17 @@ def get_llm(
         return get_openrouter_llm(llm.model, temperature)
     elif llm.provider == "xai":
         return get_grok_llm(llm.model, temperature)
+    elif llm.provider == "azure":
+        return get_azure_llm(llm.model, temperature)
+    elif llm.provider == "minimax":
+        return get_minimax_llm(llm.model, temperature)
+    elif llm.provider == "minitap":
+        return get_minitap_llm(
+            trace_id=ctx.trace_id,
+            model=llm.model,
+            temperature=temperature,
+            agent_name=name,
+        )
     else:
         raise ValueError(f"Unsupported provider: {llm.provider}")
 
@@ -146,7 +298,7 @@ def get_llm(
 T = TypeVar("T")
 
 
-async def with_fallback(
+async def with_fallback[T](
     main_call: Callable[[], Awaitable[T]],
     fallback_call: Callable[[], Awaitable[T]],
     none_should_fallback: bool = True,
@@ -154,9 +306,9 @@ async def with_fallback(
     try:
         result = await main_call()
         if result is None and none_should_fallback:
-            logger.warning("Main LLM inference returned None. Falling back...")
+            llm_logger.warning("Main LLM inference returned None. Falling back...")
             return await fallback_call()
         return result
     except Exception as e:
-        logger.warning(f"❗ Main LLM inference failed: {e}. Falling back...")
+        llm_logger.warning(f"❗ Main LLM inference failed: {e}. Falling back...")
         return await fallback_call()

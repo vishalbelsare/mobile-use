@@ -23,13 +23,21 @@ class Settings(BaseSettings):
     GOOGLE_API_KEY: SecretStr | None = None
     XAI_API_KEY: SecretStr | None = None
     OPEN_ROUTER_API_KEY: SecretStr | None = None
+    ANTHROPIC_API_KEY: SecretStr | None = None
+    AZURE_API_KEY: SecretStr | None = None
+    MINIMAX_API_KEY: SecretStr | None = None
+    MINITAP_API_KEY: SecretStr | None = None
 
     OPENAI_BASE_URL: str | None = None
+    AZURE_BASE_URL: str | None = None
+    MINITAP_API_BASE_URL: str = "https://platform.minitap.ai/api/v1"
 
-    DEVICE_SCREEN_API_BASE_URL: str | None = None
-    DEVICE_HARDWARE_BRIDGE_BASE_URL: str | None = None
     ADB_HOST: str | None = None
     ADB_PORT: int | None = None
+
+    MOBILE_USE_TELEMETRY_ENABLED: bool | None = None
+
+    PROJECT_NAME: str | None = None
 
     model_config = {"env_file": ".env", "extra": "ignore"}
 
@@ -84,16 +92,25 @@ def record_events(output_path: Path | None, events: list[str] | BaseModel | Any)
     else:
         events_content = json.dumps(events, indent=2)
 
-    with open(output_path, "w") as f:
+    with open(output_path, "w", encoding="utf-8") as f:
         f.write(events_content)
 
 
 ### LLM Configuration
 
-LLMProvider = Literal["openai", "google", "openrouter", "xai", "vertexai"]
-LLMUtilsNode = Literal["outputter", "hopper"]
-AgentNode = Literal["planner", "orchestrator", "cortex", "executor"]
-AgentNodeWithFallback = Literal["cortex"]
+LLMProvider = Literal[
+    "openai", "google", "openrouter", "xai", "vertexai", "minitap", "anthropic", "azure", "minimax"
+]
+LLMUtilsNode = Literal["outputter", "hopper", "video_analyzer"]
+LLMUtilsNodeWithFallback = LLMUtilsNode
+AgentNode = Literal[
+    "planner",
+    "orchestrator",
+    "contextor",
+    "cortex",
+    "executor",
+]
+AgentNodeWithFallback = AgentNode
 
 ROOT_DIR = Path(__file__).parent.parent.parent
 DEFAULT_LLM_CONFIG_FILENAME = "llm-config.defaults.jsonc"
@@ -117,6 +134,9 @@ class LLM(BaseModel):
 
     def validate_provider(self, name: str):
         match self.provider:
+            case "azure":
+                if not settings.AZURE_BASE_URL:
+                    raise Exception(f"{name} requires AZURE_BASE_URL in .env")
             case "openai":
                 if not settings.OPENAI_API_KEY:
                     raise Exception(f"{name} requires OPENAI_API_KEY in .env")
@@ -131,6 +151,15 @@ class LLM(BaseModel):
             case "xai":
                 if not settings.XAI_API_KEY:
                     raise Exception(f"{name} requires XAI_API_KEY in .env")
+            case "minitap":
+                if not settings.MINITAP_API_KEY:
+                    raise Exception(f"{name} requires MINITAP_API_KEY in .env")
+            case "anthropic":
+                if not settings.ANTHROPIC_API_KEY:
+                    raise Exception(f"{name} requires ANTHROPIC_API_KEY in .env")
+            case "minimax":
+                if not settings.MINIMAX_API_KEY:
+                    raise Exception(f"{name} requires MINIMAX_API_KEY in .env")
 
     def __str__(self):
         return f"{self.provider}/{self.model}"
@@ -144,41 +173,54 @@ class LLMWithFallback(LLM):
 
 
 class LLMConfigUtils(BaseModel):
-    outputter: LLM
-    hopper: LLM
+    outputter: LLMWithFallback
+    hopper: LLMWithFallback
+    video_analyzer: LLMWithFallback | None = None
 
 
 class LLMConfig(BaseModel):
-    planner: LLM
-    orchestrator: LLM
+    planner: LLMWithFallback
+    orchestrator: LLMWithFallback
+    contextor: LLMWithFallback
     cortex: LLMWithFallback
-    executor: LLM
+    executor: LLMWithFallback
     utils: LLMConfigUtils
 
     def validate_providers(self):
         self.planner.validate_provider("Planner")
         self.orchestrator.validate_provider("Orchestrator")
+        self.contextor.validate_provider("Contextor")
         self.cortex.validate_provider("Cortex")
         self.executor.validate_provider("Executor")
         self.utils.outputter.validate_provider("Outputter")
         self.utils.hopper.validate_provider("Hopper")
+        if self.utils.video_analyzer:
+            self.utils.video_analyzer.validate_provider("VideoAnalyzer")
 
     def __str__(self):
         return f"""
 📃 Planner: {self.planner}
 🎯 Orchestrator: {self.orchestrator}
+🔍 Contextor: {self.contextor}
 🧠 Cortex: {self.cortex}
 🛠️ Executor: {self.executor}
 🧩 Utils:
     🔽 Hopper: {self.utils.hopper}
     📝 Outputter: {self.utils.outputter}
+    🎬 Video Analyzer: {self.utils.video_analyzer or "Not configured"}
 """
 
-    def get_agent(self, item: AgentNode) -> LLM:
+    def get_agent(self, item: AgentNode) -> LLMWithFallback:
         return getattr(self, item)
 
-    def get_utils(self, item: LLMUtilsNode) -> LLM:
-        return getattr(self.utils, item)
+    def get_utils(self, item: LLMUtilsNode) -> LLMWithFallback:
+        value = getattr(self.utils, item)
+        if value is None:
+            raise ValueError(
+                f"Utils '{item}' is not configured. "
+                f"Please add it to your LLM config or enable it via AgentConfigBuilder."
+            )
+        return value
 
 
 def get_default_llm_config() -> LLMConfig:
@@ -191,26 +233,112 @@ def get_default_llm_config() -> LLMConfig:
     except Exception as e:
         logger.error(f"Failed to load default llm config: {e}. Falling back to hardcoded config")
         return LLMConfig(
-            planner=LLM(provider="openai", model="gpt-4.1"),
-            orchestrator=LLM(provider="openai", model="gpt-4.1"),
+            planner=LLMWithFallback(
+                provider="openai",
+                model="gpt-5-nano",
+                fallback=LLM(provider="openai", model="gpt-5-mini"),
+            ),
+            orchestrator=LLMWithFallback(
+                provider="openai",
+                model="gpt-5-nano",
+                fallback=LLM(provider="openai", model="gpt-5-mini"),
+            ),
+            contextor=LLMWithFallback(
+                provider="openai",
+                model="gpt-5-nano",
+                fallback=LLM(provider="openai", model="gpt-5-mini"),
+            ),
             cortex=LLMWithFallback(
                 provider="openai",
-                model="o3",
-                fallback=LLM(provider="openai", model="gpt-5"),
+                model="gpt-5",
+                fallback=LLM(provider="openai", model="o4-mini"),
             ),
-            executor=LLM(provider="openai", model="gpt-4.1"),
+            executor=LLMWithFallback(
+                provider="openai",
+                model="gpt-5-nano",
+                fallback=LLM(provider="openai", model="gpt-5-mini"),
+            ),
             utils=LLMConfigUtils(
-                outputter=LLM(provider="openai", model="gpt-5-nano"),
-                hopper=LLM(provider="openai", model="gpt-4.1"),
+                outputter=LLMWithFallback(
+                    provider="openai",
+                    model="gpt-5-nano",
+                    fallback=LLM(provider="openai", model="gpt-5-mini"),
+                ),
+                hopper=LLMWithFallback(
+                    provider="openai",
+                    model="gpt-5-nano",
+                    fallback=LLM(provider="openai", model="gpt-5-mini"),
+                ),
             ),
         )
 
 
+def get_default_minitap_llm_config(validate: bool = True) -> LLMConfig | None:
+    """
+    Returns a default LLM config using the Minitap provider.
+    Only returns a config if MINITAP_API_KEY is available.
+
+    Returns:
+        LLMConfig with minitap provider if API key is available, None otherwise
+    """
+    if validate and not settings.MINITAP_API_KEY:
+        return None
+
+    return LLMConfig(
+        planner=LLMWithFallback(
+            provider="minitap",
+            model="meta-llama/llama-4-scout",
+            fallback=LLM(provider="minitap", model="meta-llama/llama-4-maverick"),
+        ),
+        orchestrator=LLMWithFallback(
+            provider="minitap",
+            model="openai/gpt-oss-120b",
+            fallback=LLM(provider="minitap", model="meta-llama/llama-4-maverick"),
+        ),
+        contextor=LLMWithFallback(
+            provider="minitap",
+            model="meta-llama/llama-3.1-8b-instruct",
+            fallback=LLM(provider="minitap", model="meta-llama/llama-3.3-70b-instruct"),
+        ),
+        cortex=LLMWithFallback(
+            provider="minitap",
+            model="google/gemini-3-pro-preview",
+            fallback=LLM(provider="minitap", model="openai/gpt-5"),
+        ),
+        executor=LLMWithFallback(
+            provider="minitap",
+            model="meta-llama/llama-3.3-70b-instruct",
+            fallback=LLM(provider="minitap", model="openai/gpt-5-mini"),
+        ),
+        utils=LLMConfigUtils(
+            outputter=LLMWithFallback(
+                provider="minitap",
+                model="openai/gpt-5-nano",
+                fallback=LLM(provider="minitap", model="openai/gpt-5-mini"),
+            ),
+            hopper=LLMWithFallback(
+                provider="minitap",
+                model="openai/gpt-5-nano",
+                fallback=LLM(provider="minitap", model="openai/gpt-5-mini"),
+            ),
+        ),
+    )
+
+
 def deep_merge_llm_config(default: LLMConfig, override: dict) -> LLMConfig:
-    def _deep_merge_dict(base: dict, extra: dict):
+    def _deep_merge_dict(base: dict, extra: dict, path: str = ""):
         for key, value in extra.items():
-            if isinstance(value, dict):
-                _deep_merge_dict(base[key], value)
+            current_path = f"{path}.{key}" if path else key
+
+            if key not in base:
+                logger.warning(
+                    f"Unsupported config key '{current_path}' found in override config. "
+                    f"Ignoring this key."
+                )
+                continue
+
+            if isinstance(value, dict) and isinstance(base[key], dict):
+                _deep_merge_dict(base[key], value, current_path)
             else:
                 base[key] = value
 

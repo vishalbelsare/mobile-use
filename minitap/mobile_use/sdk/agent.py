@@ -1,43 +1,49 @@
 import asyncio
+import hashlib
+import shutil
 import sys
 import tempfile
-import time
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
+from io import BytesIO
 from pathlib import Path
 from shutil import which
 from types import NoneType
 from typing import TypeVar, overload
 
+import httpx
 from adbutils import AdbClient
+from dotenv import load_dotenv
 from langchain_core.messages import AIMessage
+from limrun_api import AsyncLimrun
+from PIL import Image
 from pydantic import BaseModel
 
 from minitap.mobile_use.agents.outputter.outputter import outputter
-from minitap.mobile_use.clients.device_hardware_client import DeviceHardwareClient
-from minitap.mobile_use.clients.screen_api_client import ScreenApiClient
-from minitap.mobile_use.config import OutputConfig, record_events
+from minitap.mobile_use.clients.browserstack_client import BrowserStackClientWrapper
+from minitap.mobile_use.clients.idb_client import IdbClientWrapper
+from minitap.mobile_use.clients.ios_client import DeviceType, IosClientWrapper, get_ios_client
+from minitap.mobile_use.clients.ui_automator_client import UIAutomatorClient
+from minitap.mobile_use.clients.wda_client import WdaClientWrapper
+from minitap.mobile_use.config import OutputConfig, record_events, settings
 from minitap.mobile_use.context import (
     DeviceContext,
     DevicePlatform,
     ExecutionSetup,
     MobileUseContext,
 )
-from minitap.mobile_use.controllers.mobile_command_controller import (
-    ScreenDataResponse,
-    get_screen_data,
+from minitap.mobile_use.controllers.cloud_device_controller import (
+    CloudAndroidController,
+    CloudIosController,
 )
 from minitap.mobile_use.controllers.platform_specific_commands_controller import get_first_device
 from minitap.mobile_use.graph.graph import get_graph
 from minitap.mobile_use.graph.state import State
 from minitap.mobile_use.sdk.builders.agent_config_builder import get_default_agent_config
 from minitap.mobile_use.sdk.builders.task_request_builder import TaskRequestBuilder
-from minitap.mobile_use.sdk.constants import (
-    DEFAULT_HW_BRIDGE_BASE_URL,
-    DEFAULT_SCREEN_API_BASE_URL,
-)
-from minitap.mobile_use.sdk.types.agent import AgentConfig
+from minitap.mobile_use.sdk.types.agent import AgentConfig, CloudDevicePlatform
 from minitap.mobile_use.sdk.types.exceptions import (
+    AgentError,
     AgentNotInitializedError,
     AgentProfileNotFoundError,
     AgentTaskRequestError,
@@ -45,13 +51,13 @@ from minitap.mobile_use.sdk.types.exceptions import (
     ExecutableNotFoundError,
     ServerStartupError,
 )
-from minitap.mobile_use.sdk.types.task import AgentProfile, Task, TaskRequest, TaskStatus
-from minitap.mobile_use.servers.device_hardware_bridge import BridgeStatus
-from minitap.mobile_use.servers.start_servers import (
-    start_device_hardware_bridge,
-    start_device_screen_api,
+from minitap.mobile_use.sdk.types.task import (
+    AgentProfile,
+    Task,
+    TaskRequest,
 )
-from minitap.mobile_use.servers.stop_servers import stop_servers
+from minitap.mobile_use.services.telemetry import telemetry
+from minitap.mobile_use.utils.app_launch_utils import _handle_initial_app_launch
 from minitap.mobile_use.utils.logger import get_logger
 from minitap.mobile_use.utils.media import (
     create_gif_from_trace_folder,
@@ -65,41 +71,98 @@ logger = get_logger(__name__)
 
 TOutput = TypeVar("TOutput", bound=BaseModel | None)
 
+load_dotenv()
+
 
 class Agent:
     _config: AgentConfig
     _tasks: list[Task] = []
     _tmp_traces_dir: Path
     _initialized: bool = False
-    _is_default_screen_api: bool
-    _is_default_hw_bridge: bool
     _device_context: DeviceContext
-    _screen_api_client: ScreenApiClient
-    _hw_bridge_client: DeviceHardwareClient
     _adb_client: AdbClient | None
+    _ui_adb_client: UIAutomatorClient | None
+    _ios_client: IosClientWrapper | None
+    _ios_device_type: DeviceType | None
+    _current_task: asyncio.Task | None = None
+    _task_lock: asyncio.Lock
+    _cloud_instance_id: str | None = None
+    _cloud_controller: CloudAndroidController | CloudIosController | None = None
 
-    def __init__(self, config: AgentConfig | None = None):
+    def __init__(self, *, config: AgentConfig | None = None):
         self._config = config or get_default_agent_config()
         self._tasks = []
         self._tmp_traces_dir = Path(tempfile.gettempdir()) / "mobile-use-traces"
         self._initialized = False
-        self._is_default_hw_bridge = (
-            self._config.servers.hw_bridge_base_url == DEFAULT_HW_BRIDGE_BASE_URL
-        )
-        self._is_default_screen_api = (
-            self._config.servers.screen_api_base_url == DEFAULT_SCREEN_API_BASE_URL
-        )
+        self._task_lock = asyncio.Lock()
 
-    def init(
+    async def init(
         self,
         server_restart_attempts: int = 3,
         retry_count: int = 5,
         retry_wait_seconds: int = 5,
     ):
-        if not which("adb"):
-            raise ExecutableNotFoundError("adb")
-        if self._is_default_hw_bridge and not which("maestro"):
-            raise ExecutableNotFoundError("maestro")
+        # Start telemetry session for SDK usage (if not already started by CLI)
+        if not telemetry._session_id:
+            telemetry.start_session({"source": "sdk"})
+
+        try:
+            return await self._init_internal(
+                server_restart_attempts=server_restart_attempts,
+                retry_count=retry_count,
+                retry_wait_seconds=retry_wait_seconds,
+            )
+        except Exception as e:
+            session_id = telemetry._session_id
+            telemetry.capture_exception(e, {"phase": "agent_init"})
+            telemetry.end_session(success=False, error=str(e))
+            if session_id:
+                logger.info(f"If you need support, please include this session ID: {session_id}")
+            raise
+
+    async def _init_internal(
+        self,
+        server_restart_attempts: int = 3,
+        retry_count: int = 5,
+        retry_wait_seconds: int = 5,
+    ):
+        # Handle BrowserStack initialization
+        if self._config.browserstack_config:
+            logger.info("Initializing BrowserStack session...")
+            self._ios_client = BrowserStackClientWrapper(config=self._config.browserstack_config)
+            session_started = await self._ios_client.init_client()
+            if not session_started:
+                raise ServerStartupError(
+                    message="Failed to create BrowserStack session. "
+                    "Please check your credentials and device configuration."
+                )
+            self._ios_device_type = DeviceType.BROWSERSTACK
+            self._adb_client = None
+            self._ui_adb_client = None
+            logger.success("BrowserStack session created successfully")
+
+            self._device_context = await self._get_device_context(
+                device_id="browserstack", platform=DevicePlatform.IOS
+            )
+            logger.info(self._device_context.to_str())
+            logger.info("✅ Mobile-use agent initialized with BrowserStack.")
+            self._initialized = True
+            telemetry.capture_agent_initialized(
+                platform=DevicePlatform.IOS.value,
+                device_id="browserstack",
+            )
+            return True
+
+        if self._config.cloud_android_controller or self._config.cloud_ios_controller:
+            return await self._init_cloud_device(
+                android_controller=self._config.cloud_android_controller,
+                ios_controller=self._config.cloud_ios_controller,
+            )
+        if self._config.cloud_device_config:
+            return await self._init_cloud_device()
+
+        if not which("adb") and not which("xcrun"):
+            raise ExecutableNotFoundError("cli_tools")
 
         if self._initialized:
             logger.warning("Agent is already initialized. Skipping...")
@@ -107,9 +170,10 @@ class Agent:
 
         # Get first available device ID
         if not self._config.device_id or not self._config.device_platform:
-            device_id, platform = get_first_device()
+            device_id, platform, ios_device_type = get_first_device(logger=logger)
         else:
             device_id, platform = self._config.device_id, self._config.device_platform
+            ios_device_type = None  # Will be auto-detected in _init_clients
 
         if not device_id or not platform:
             error_msg = "No device found. Exiting."
@@ -118,10 +182,34 @@ class Agent:
 
         # Initialize clients
         self._init_clients(
+            device_id=device_id,
             platform=platform,
+            ios_device_type=ios_device_type,
             retry_count=retry_count,
             retry_wait_seconds=retry_wait_seconds,
         )
+
+        # Initialize iOS client (IDB companion for simulators, WDA already running for physical)
+        if self._ios_client:
+            if isinstance(self._ios_client, IdbClientWrapper):
+                logger.info("Starting IDB companion for iOS simulator...")
+                companion_started = await self._ios_client.init_companion()
+                if not companion_started:
+                    raise ServerStartupError(
+                        message="Failed to start IDB companion for iOS simulator. "
+                        "Please ensure fb-idb is installed: https://fbidb.io/docs/installation/"
+                    )
+                logger.success("IDB companion started successfully")
+            elif isinstance(self._ios_client, WdaClientWrapper):
+                logger.info("Connecting to WebDriverAgent for physical iOS device...")
+                wda_connected = await self._ios_client.init_client()
+                if not wda_connected:
+                    raise ServerStartupError(
+                        message="Failed to connect to WebDriverAgent. "
+                        "Please ensure WDA is running on your device. "
+                        "See the setup instructions above."
+                    )
+                logger.success("WDA client connected for physical device")
 
         # Start necessary servers
         restart_attempt = 0
@@ -139,22 +227,248 @@ class Agent:
                     f"Server start failed, attempting restart "
                     f"{restart_attempt}/{server_restart_attempts}"
                 )
-                stop_servers(
-                    should_stop_screen_api=self._is_default_screen_api,
-                    should_stop_hw_bridge=self._is_default_hw_bridge,
-                )
             else:
                 error_msg = "Mobile-use servers failed to start after all restart attempts."
                 logger.error(error_msg)
                 raise ServerStartupError(message=error_msg)
 
-        self._device_context = self._get_device_context(device_id=device_id, platform=platform)
+        self._device_context = await self._get_device_context(
+            device_id=device_id, platform=platform
+        )
         logger.info(self._device_context.to_str())
         logger.info("✅ Mobile-use agent initialized.")
         self._initialized = True
+        telemetry.capture_agent_initialized(
+            platform=platform.value,
+            device_id=device_id,
+        )
         return True
 
+    async def install_apk(self, apk_path: str | Path) -> None:
+        """
+        Install an APK on the connected device.
+        Args:
+            apk_path: Path to the local APK file to install
+
+        Raises:
+            AgentNotInitializedError: If the agent is not initialized
+            AgentError: If attempting to install on non-Android device or ADB operations fail
+            FileNotFoundError: If the APK file doesn't exist
+        """
+        try:
+            await self._install_apk_internal(apk_path)
+        except Exception as e:
+            telemetry.capture_exception(e, {"phase": "install_apk"})
+            raise
+
+    async def _install_apk_internal(self, apk_path: str | Path) -> None:
+        if isinstance(apk_path, str):
+            apk_path = Path(apk_path)
+
+        if not apk_path.exists():
+            raise FileNotFoundError(f"APK file not found: {apk_path}")
+
+        if not self._initialized:
+            raise AgentNotInitializedError()
+
+        if self._device_context.mobile_platform != DevicePlatform.ANDROID:
+            raise AgentError(
+                "APK can only be installed on Android devices but got "
+                f"'{self._device_context.mobile_platform.value}'"
+            )
+
+        device_id = self._device_context.device_id
+        logger.info(f"Installing APK on Android device '{device_id}'")
+        if not self._adb_client:
+            raise AgentError("ADB client not initialized")
+
+        device = self._adb_client.device(serial=device_id)
+        await asyncio.to_thread(device.install, apk_path)
+        logger.info(f"APK installed successfully on Android device '{device_id}'")
+
+    async def install_app(self, app_path: str | Path) -> str | None:
+        """
+        Install an app on the connected device.
+
+        For Android: Installs an APK file using ADB.
+        For cloud iOS: Uploads and installs a .app folder using diff-based
+                         patch syncing for fast updates.
+
+        Args:
+            app_path: Path to the app to install:
+                      - Android: Path to an APK file
+                      - iOS: Path to a .app folder (simulator build)
+
+        Returns:
+            The bundle ID of the installed app (iOS only), or None for Android.
+
+        Raises:
+            AgentNotInitializedError: If the agent is not initialized
+            AgentError: If installation fails or platform is unsupported
+            FileNotFoundError: If the app file/folder doesn't exist
+        """
+        try:
+            return await self._install_app_internal(app_path)
+        except Exception as e:
+            telemetry.capture_exception(e, {"phase": "install_app"})
+            raise
+
+    async def _install_app_internal(self, app_path: str | Path) -> str | None:
+        if isinstance(app_path, str):
+            app_path = Path(app_path)
+
+        if not app_path.exists():
+            raise FileNotFoundError(f"App not found: {app_path}")
+
+        if not self._initialized:
+            raise AgentNotInitializedError()
+
+        platform = self._device_context.mobile_platform
+
+        if platform == DevicePlatform.ANDROID:
+            await self._install_apk_internal(app_path)
+            return None
+
+        elif platform == DevicePlatform.IOS:
+            return await self._install_ios_app(app_path)
+
+        else:
+            raise AgentError(f"App installation not supported for platform: {platform}")
+
+    async def _install_ios_app(self, app_path: Path) -> str:
+        """
+        Install an iOS .app bundle on a cloud iOS device.
+
+        Uses diff-based patch syncing for fast updates - only changed parts
+        of the app are uploaded.
+
+        Args:
+            app_path: Path to the .app folder (simulator build)
+
+        Returns:
+            The bundle ID of the installed app
+
+        Raises:
+            AgentError: If not connected to a supported cloud iOS device
+            FileNotFoundError: If the .app folder doesn't exist
+        """
+
+        if not app_path.is_dir() or not app_path.suffix == ".app":
+            raise AgentError(
+                f"Expected a .app folder for iOS, got: {app_path}. "
+                "Please provide the path to your built .app folder "
+                "(e.g., build/Debug-iphonesimulator/MyApp.app)"
+            )
+
+        if not isinstance(self._ios_client, CloudIosController):
+            raise AgentError(
+                "iOS app installation is only supported for cloud iOS devices. "
+                "For local simulators, use 'xcrun simctl install' directly."
+            )
+
+        cloud_controller: CloudIosController = self._ios_client
+
+        api_key_value: str | None = None
+        cloud_config = self._config.cloud_device_config
+        if cloud_config and cloud_config.api_key:
+            api_key_value = cloud_config.api_key
+        elif settings.MINITAP_API_KEY:
+            api_key_raw = settings.MINITAP_API_KEY
+            api_key_value = (
+                api_key_raw.get_secret_value()
+                if hasattr(api_key_raw, "get_secret_value")
+                else str(api_key_raw)
+            )
+        if not api_key_value:
+            raise AgentError(
+                "API key is required for iOS app installation. "
+                "Set MINITAP_API_KEY environment variable."
+            )
+
+        base_url = settings.MINITAP_API_BASE_URL.rstrip("/")
+        if cloud_config and cloud_config.base_url:
+            base_url = f"{cloud_config.base_url.rstrip('/')}/api/v1"
+
+        app_name = app_path.stem
+        asset_name = f"{app_name}.zip"
+
+        logger.info(f"Preparing iOS app for upload: {app_name}")
+
+        # Create a temporary zip file
+        with tempfile.TemporaryDirectory() as temp_dir:
+            zip_path = Path(temp_dir) / asset_name
+            zip_base = str(zip_path.with_suffix(""))
+            shutil.make_archive(zip_base, "zip", app_path.parent, app_path.name)
+
+            # Calculate MD5 hash
+            md5 = hashlib.md5()
+            with open(zip_path, "rb") as f:
+                for chunk in iter(lambda: f.read(8192), b""):
+                    md5.update(chunk)
+            md5_hash = md5.hexdigest()
+
+            logger.info(f"Created zip archive: {zip_path.name}, MD5: {md5_hash}")
+
+            client = AsyncLimrun(api_key=api_key_value, base_url=f"{base_url}/limrun")
+            try:
+                logger.info("Getting cloud upload URL...")
+                asset_response = await client.assets.get_or_create(name=asset_name)
+
+                # Check if we need to upload (MD5 mismatch or no existing file)
+                existing_md5 = asset_response.md5
+                if existing_md5 == md5_hash:
+                    logger.info("App already uploaded with matching MD5, skipping upload")
+                else:
+                    upload_url = asset_response.signed_upload_url
+                    if not upload_url:
+                        raise AgentError("No upload URL returned by the cloud device API")
+
+                    logger.info("Uploading iOS app to cloud storage...")
+                    async with httpx.AsyncClient(timeout=300.0) as http_client:
+                        file_content = zip_path.read_bytes()
+                        response = await http_client.put(
+                            upload_url,
+                            content=file_content,
+                            headers={"Content-Type": "application/zip"},
+                        )
+                        response.raise_for_status()
+                    logger.info("iOS app uploaded successfully")
+
+                download_url = asset_response.signed_download_url
+                if not download_url:
+                    raise AgentError("No download URL returned by the cloud device API")
+
+            finally:
+                await client.close()
+
+        logger.info("Installing app on cloud iOS device...")
+        install_result = await cloud_controller.client.install_app(url=download_url, md5=md5_hash)
+        bundle_id = install_result.get("bundleId", "")
+
+        if bundle_id:
+            logger.success(f"iOS app installed successfully: {bundle_id}")
+        else:
+            logger.success("iOS app installed successfully")
+
+        return bundle_id
+
     def new_task(self, goal: str):
+        """
+        Create a new task request builder.
+
+        Args:
+            goal: Natural language description of what to accomplish
+
+        Returns:
+            TaskRequestBuilder that can be configured with:
+            - .with_output_format() for structured output
+            - .with_output_description() for output description
+            - .with_locked_app_package() to restrict execution to a specific app
+            - .using_profile() to specify an LLM profile
+            - .with_max_steps() to set maximum execution steps
+            - .with_trace_recording() to enable trace recording
+            - .with_name() to set a custom task name
+        """
         return TaskRequestBuilder[None].from_common(
             goal=goal,
             common=self._config.task_request_defaults,
@@ -168,6 +482,8 @@ class Agent:
         output: type[TOutput],
         profile: str | AgentProfile | None = None,
         name: str | None = None,
+        locked_app_package: str | None = None,
+        app_path: str | Path | None = None,
     ) -> TOutput | None: ...
 
     @overload
@@ -178,6 +494,8 @@ class Agent:
         output: str,
         profile: str | AgentProfile | None = None,
         name: str | None = None,
+        locked_app_package: str | None = None,
+        app_path: str | Path | None = None,
     ) -> str | dict | None: ...
 
     @overload
@@ -188,13 +506,27 @@ class Agent:
         output=None,
         profile: str | AgentProfile | None = None,
         name: str | None = None,
+        locked_app_package: str | None = None,
+        app_path: str | Path | None = None,
     ) -> str | None: ...
 
     @overload
-    async def run_task(self, *, request: TaskRequest[None]) -> str | dict | None: ...
+    async def run_task(
+        self,
+        *,
+        request: TaskRequest[None],
+        locked_app_package: str | None = None,
+        app_path: str | Path | None = None,
+    ) -> str | dict | None: ...
 
     @overload
-    async def run_task(self, *, request: TaskRequest[TOutput]) -> TOutput | None: ...
+    async def run_task(
+        self,
+        *,
+        request: TaskRequest[TOutput],
+        locked_app_package: str | None = None,
+        app_path: str | Path | None = None,
+    ) -> TOutput | None: ...
 
     async def run_task(
         self,
@@ -202,11 +534,27 @@ class Agent:
         goal: str | None = None,
         output: type[TOutput] | str | None = None,
         profile: str | AgentProfile | None = None,
+        locked_app_package: str | None = None,
         name: str | None = None,
+        app_path: str | Path | None = None,
         request: TaskRequest[TOutput] | None = None,
     ) -> str | dict | TOutput | None:
         if request is not None:
-            return await self._run_task(request)
+            if locked_app_package is not None:
+                if request.locked_app_package:
+                    logger.warning(
+                        "Locked app package specified both in the request and as a parameter. "
+                        "Using the parameter value."
+                    )
+                request.locked_app_package = locked_app_package
+            if app_path is not None:
+                if request.app_path:
+                    logger.warning(
+                        "App path specified both in the request and as a parameter. "
+                        "Using the parameter value."
+                    )
+                request.app_path = Path(app_path) if isinstance(app_path, str) else app_path
+            return await self._run_task(request=request)
         if goal is None:
             raise AgentTaskRequestError("Goal is required")
         task_request = self.new_task(goal=goal)
@@ -219,9 +567,16 @@ class Agent:
             task_request.using_profile(profile=profile)
         if name is not None:
             task_request.with_name(name=name)
+        if locked_app_package is not None:
+            task_request.with_locked_app_package(package_name=locked_app_package)
+        if app_path is not None:
+            task_request.with_app_path(app_path=app_path)
         return await self._run_task(task_request.build())
 
-    async def _run_task(self, request: TaskRequest[TOutput]) -> str | dict | TOutput | None:
+    async def _run_task(
+        self,
+        request: TaskRequest[TOutput],
+    ) -> str | dict | TOutput | None:
         if not self._initialized:
             raise AgentNotInitializedError()
 
@@ -231,27 +586,54 @@ class Agent:
                 raise AgentProfileNotFoundError(request.profile)
         else:
             agent_profile = self._config.default_profile
+
+        if (
+            self._config.video_recording_enabled
+            and agent_profile.llm_config.utils.video_analyzer is None
+        ):
+            raise ValueError(
+                f"with_video_recording_tools() requires 'video_analyzer' in utils for "
+                f"profile '{agent_profile.name}'. Add 'video_analyzer' with a "
+                f"video-capable model (e.g., gemini-3-flash-preview)."
+            )
+
         logger.info(str(agent_profile))
 
+        task_id = str(uuid.uuid4())
+
         task = Task(
-            id=str(uuid.uuid4()),
+            id=task_id,
             device=self._device_context,
-            status=TaskStatus.PENDING,
+            status="pending",
             request=request,
             created_at=datetime.now(),
         )
         self._tasks.append(task)
         task_name = task.get_name()
 
+        cloud_android_controller = (
+            self._cloud_controller
+            if isinstance(self._cloud_controller, CloudAndroidController)
+            else None
+        )
+
         context = MobileUseContext(
+            trace_id=task.id,
             device=self._device_context,
-            hw_bridge_client=self._hw_bridge_client,
-            screen_api_client=self._screen_api_client,
             adb_client=self._adb_client,
+            ui_adb_client=self._ui_adb_client,
+            ios_client=self._ios_client,
+            cloud_android_controller=cloud_android_controller,
             llm_config=agent_profile.llm_config,
+            video_recording_enabled=(
+                self._config.video_recording_enabled
+                and agent_profile.llm_config.utils.video_analyzer is not None
+            ),
         )
 
         self._prepare_tracing(task=task, context=context)
+        await self._prepare_app_installation(task=task)
+        await self._prepare_app_lock(task=task, context=context)
         self._prepare_output_files(task=task)
 
         output_config = None
@@ -265,88 +647,479 @@ class Agent:
         logger.info(f"[{task_name}] Starting graph with goal: `{request.goal}`")
         state = self._get_graph_state(task=task)
         graph_input = state.model_dump()
+        task_start_time = datetime.now(UTC)
 
-        last_state: State | None = None
-        last_state_snapshot: dict | None = None
-        output = None
-        try:
-            logger.info(f"[{task_name}] Invoking graph with input: {graph_input}")
-            task.status = TaskStatus.RUNNING
-            async for chunk in (await get_graph(context)).astream(
-                input=graph_input,
-                config={
-                    "recursion_limit": task.request.max_steps,
-                    "callbacks": self._config.graph_config_callbacks,
-                },
-                stream_mode=["messages", "custom", "updates", "values"],
-            ):
-                stream_mode, payload = chunk
-                if stream_mode == "values":
-                    last_state_snapshot = payload  # type: ignore
-                    last_state = State(**last_state_snapshot)  # type: ignore
-                    if task.request.thoughts_output_path:
-                        record_events(
-                            output_path=task.request.thoughts_output_path,
-                            events=last_state.agents_thoughts,
-                        )
+        telemetry.capture_task_started(
+            task_id=task_id,
+            platform=self._device_context.mobile_platform.value,
+            has_locked_app=request.locked_app_package is not None,
+        )
 
-                if stream_mode == "updates":
-                    for _, value in payload.items():  # type: ignore node name, node output
-                        if value and "agents_thoughts" in value:
-                            new_thoughts = value["agents_thoughts"]
-                            last_item = new_thoughts[-1] if new_thoughts else None
-                            if last_item:
-                                log_agent_thought(
-                                    agent_thought=last_item,
-                                )
+        async def _execute_task_logic():
+            last_state: State | None = None
+            last_state_snapshot: dict | None = None
+            output = None
+            try:
+                logger.info(f"[{task_name}] Invoking graph with input: {graph_input}")
+                await task.set_status(status="running", message="Invoking graph...")
+                async for chunk in (await get_graph(context)).astream(
+                    input=graph_input,
+                    config={
+                        "recursion_limit": task.request.max_steps,
+                        "callbacks": self._config.graph_config_callbacks,
+                    },
+                    stream_mode=["messages", "custom", "updates", "values"],
+                ):
+                    stream_mode, payload = chunk
+                    if stream_mode == "values":
+                        last_state_snapshot = payload  # type: ignore
+                        last_state = State(**last_state_snapshot)  # type: ignore
+                        if task.request.thoughts_output_path:
+                            record_events(
+                                output_path=task.request.thoughts_output_path,
+                                events=last_state.agents_thoughts,
+                            )
 
-            if not last_state:
-                err = f"[{task_name}] No result received from graph"
+                    if stream_mode == "updates":
+                        for _, value in payload.items():  # type: ignore node name, node output
+                            if value and "agents_thoughts" in value:
+                                new_thoughts = value["agents_thoughts"]
+                                last_item = new_thoughts[-1] if new_thoughts else None
+                                if last_item:
+                                    log_agent_thought(
+                                        agent_thought=last_item,
+                                    )
+
+                if not last_state:
+                    err = f"[{task_name}] No result received from graph"
+                    logger.warning(err)
+                    await task.finalize(content=output, state=last_state_snapshot, error=err)
+                    return None
+
+                print_ai_response_to_stderr(graph_result=last_state)
+                output = await self._extract_output(
+                    task_name=task_name,
+                    ctx=context,
+                    request=request,
+                    output_config=output_config,
+                    state=last_state,
+                )
+                logger.info(f"✅ Automation '{task_name}' is success ✅")
+                await task.finalize(content=output, state=last_state_snapshot)
+                duration = (datetime.now(UTC) - task_start_time).total_seconds()
+                steps_count = len(last_state.agents_thoughts) if last_state else 0
+                telemetry.capture_task_completed(
+                    task_id=task_id,
+                    success=True,
+                    steps_count=steps_count,
+                    duration_seconds=duration,
+                )
+                return output
+            except asyncio.CancelledError:
+                err = f"[{task_name}] Task cancelled"
                 logger.warning(err)
-                task.finalize(content=output, state=last_state_snapshot, error=err)
-                return None
+                await task.finalize(
+                    content=output,
+                    state=last_state_snapshot,
+                    error=err,
+                    cancelled=True,
+                )
+                duration = (datetime.now(UTC) - task_start_time).total_seconds()
+                steps_count = len(last_state.agents_thoughts) if last_state else 0
+                telemetry.capture_task_completed(
+                    task_id=task_id,
+                    success=False,
+                    steps_count=steps_count,
+                    duration_seconds=duration,
+                    cancelled=True,
+                )
+                raise
+            except Exception as e:
+                err = f"[{task_name}] Error running automation: {e}"
+                logger.error(err)
+                await task.finalize(
+                    content=output,
+                    state=last_state_snapshot,
+                    error=err,
+                )
+                duration = (datetime.now(UTC) - task_start_time).total_seconds()
+                steps_count = len(last_state.agents_thoughts) if last_state else 0
+                telemetry.capture_task_completed(
+                    task_id=task_id,
+                    success=False,
+                    steps_count=steps_count,
+                    duration_seconds=duration,
+                )
+                telemetry.capture_exception(e, {"task_id": task_id})
+                if telemetry._session_id:
+                    logger.info(
+                        "If you need support, please include this session ID: "
+                        f"{telemetry._session_id}"
+                    )
+                raise
+            finally:
+                await self._finalize_tracing(task=task, context=context)
 
-            print_ai_response_to_stderr(graph_result=last_state)
-            output = await self._extract_output(
-                task_name=task_name,
-                ctx=context,
-                request=request,
-                output_config=output_config,
-                state=last_state,
-            )
-            logger.info(f"✅ Automation '{task_name}' is success ✅")
-            task.finalize(content=output, state=last_state_snapshot)
-        except asyncio.CancelledError:
-            err = f"[{task_name}] Task cancelled"
-            logger.warning(err)
-            task.finalize(content=output, state=last_state_snapshot, error=err, cancelled=True)
-            raise
-        except Exception as e:
-            err = f"[{task_name}] Error running automation: {e}"
-            logger.error(err)
-            task.finalize(content=output, state=last_state_snapshot, error=err)
-            raise
-        finally:
-            self._finalize_tracing(task=task, context=context)
-        return output
+        async with self._task_lock:
+            if self._current_task and not self._current_task.done():
+                logger.warning(
+                    "Another automation task is already running. "
+                    "Stopping it before starting the new one."
+                )
+                self.stop_current_task()
+                try:
+                    await self._current_task
+                except asyncio.CancelledError:
+                    pass
 
-    def clean(self, force: bool = False):
+            try:
+                self._current_task = asyncio.create_task(_execute_task_logic())
+                return await self._current_task
+            finally:
+                self._current_task = None
+
+    def stop_current_task(self):
+        """Requests cancellation of the currently running automation task."""
+        if self._current_task and not self._current_task.done():
+            logger.info("Requesting to stop the current automation task...")
+            was_cancelled = self._current_task.cancel()
+            if was_cancelled:
+                logger.success("Cancellation request for the current task was sent.")
+            else:
+                logger.warning(
+                    "Could not send cancellation request for the current task "
+                    "(it may already be completing)."
+                )
+        else:
+            logger.info("No active automation task to stop.")
+
+    async def get_screenshot(self) -> Image.Image:
+        """
+        Capture a screenshot from the mobile device.
+
+        Returns:
+            Screenshot as PIL Image
+
+        Raises:
+            AgentNotInitializedError: If the agent is not initialized
+            Exception: If screenshot capture fails
+        """
+        if not self._initialized:
+            raise AgentNotInitializedError()
+
+        if self._device_context.mobile_platform == DevicePlatform.ANDROID:
+            # Use ADB to capture screenshot
+            logger.info("Capturing screenshot from local Android device")
+            if not self._adb_client:
+                raise Exception("ADB client not initialized")
+
+            device = self._adb_client.device(serial=self._device_context.device_id)
+            screenshot = await asyncio.to_thread(device.screenshot)
+            logger.info("Screenshot captured from local Android device")
+            return screenshot
+
+        elif self._device_context.mobile_platform == DevicePlatform.IOS:
+            from io import BytesIO
+
+            if isinstance(self._ios_client, CloudIosController):
+                logger.info("Capturing screenshot from cloud iOS device")
+                screenshot_bytes = await self._ios_client.screenshot()
+                if screenshot_bytes is None:
+                    raise Exception("Failed to capture screenshot from cloud iOS device")
+                screenshot = Image.open(BytesIO(screenshot_bytes))
+                logger.info("Screenshot captured from cloud iOS device")
+                return screenshot
+
+            # Use xcrun to capture screenshot for local simulators
+            import functools
+            import subprocess
+
+            logger.info("Capturing screenshot from local iOS device")
+            try:
+                # xcrun simctl io <device> screenshot --type=png -
+                result = await asyncio.to_thread(
+                    functools.partial(
+                        subprocess.run,
+                        [
+                            "xcrun",
+                            "simctl",
+                            "io",
+                            self._device_context.device_id,
+                            "screenshot",
+                            "--type=png",
+                            "-",
+                        ],
+                        capture_output=True,
+                        check=True,
+                    )
+                )
+                # Convert bytes to PIL Image
+                screenshot = Image.open(BytesIO(result.stdout))
+                logger.info("Screenshot captured from local iOS device")
+                return screenshot
+            except subprocess.CalledProcessError as e:
+                logger.error(f"Failed to capture screenshot: {e}")
+                raise Exception(f"Failed to capture screenshot from iOS device: {e}")
+
+        else:
+            raise Exception(f"Unsupported platform: {self._device_context.mobile_platform}")
+
+    async def clean(self, force: bool = False):
+        if self._cloud_instance_id:
+            await self._cleanup_cloud_device()
+            self._initialized = False
+            logger.info("✅ Cloud device agent stopped.")
+            if telemetry._session_id and telemetry._session_context.get("source") == "sdk":
+                telemetry.end_session(success=True)
+            return
+
         if not self._initialized and not force:
             return
-        screen_api_ok, hw_bridge_ok = stop_servers(
-            should_stop_screen_api=self._is_default_screen_api,
-            should_stop_hw_bridge=self._is_default_hw_bridge,
-        )
-        if not screen_api_ok:
-            logger.warning("Failed to stop Device Screen API.")
-        if not hw_bridge_ok:
-            logger.warning("Failed to stop Device Hardware Bridge.")
+
+        if self._ios_client:
+            await self._ios_client.cleanup()
+            self._ios_client = None
+
         self._initialized = False
         logger.info("✅ Mobile-use agent stopped.")
 
+        # End telemetry session if started by SDK (not CLI)
+        if telemetry._session_id and telemetry._session_context.get("source") == "sdk":
+            telemetry.end_session(success=True)
+
+    async def _init_cloud_device(
+        self,
+        android_controller: CloudAndroidController | None = None,
+        ios_controller: CloudIosController | None = None,
+    ) -> bool:
+        """
+        Initialize a cloud device.
+
+        This method either uses pre-configured controllers or provisions a new
+        device based on cloud_device_config, connects to it, and sets up the
+        appropriate clients for device interaction.
+
+        Args:
+            android_controller: Pre-configured cloud Android controller.
+            ios_controller: Pre-configured cloud iOS controller.
+        """
+
+        # Use pre-configured Android controller
+        if android_controller is not None:
+            logger.info("Using pre-configured cloud Android controller")
+            self._cloud_controller = android_controller
+            self._cloud_instance_id = android_controller.instance_id
+
+            self._adb_client = android_controller._adb_client
+            self._ui_adb_client = android_controller._ui_client
+            self._ios_client = None
+            self._ios_device_type = None
+
+            self._device_context = DeviceContext(
+                host_platform="LINUX",
+                mobile_platform=DevicePlatform.ANDROID,
+                device_id=android_controller._adb_serial or self._cloud_instance_id,
+                device_width=android_controller.device_width,
+                device_height=android_controller.device_height,
+            )
+
+            logger.info(f"Cloud Android device ready: {self._cloud_instance_id}")
+            logger.info(self._device_context.to_str())
+            logger.info("✅ Mobile-use agent initialized with a cloud Android device.")
+            self._initialized = True
+            telemetry.capture_agent_initialized(
+                platform=DevicePlatform.ANDROID.value,
+                device_id=self._cloud_instance_id,
+            )
+            return True
+
+        # Use pre-configured iOS controller
+        if ios_controller is not None:
+            logger.info("Using pre-configured cloud iOS controller")
+            self._cloud_controller = ios_controller
+            self._cloud_instance_id = ios_controller.instance_id
+
+            self._adb_client = None
+            self._ui_adb_client = None
+            self._ios_client = ios_controller
+            self._ios_device_type = DeviceType.CLOUD
+
+            self._device_context = DeviceContext(
+                host_platform="LINUX",
+                mobile_platform=DevicePlatform.IOS,
+                device_id=self._cloud_instance_id,
+                device_width=ios_controller.device_width,
+                device_height=ios_controller.device_height,
+            )
+
+            logger.info(f"Cloud iOS device ready: {self._cloud_instance_id}")
+            logger.info(self._device_context.to_str())
+            logger.info("✅ Mobile-use agent initialized with a cloud iOS device.")
+            self._initialized = True
+            telemetry.capture_agent_initialized(
+                platform=DevicePlatform.IOS.value,
+                device_id=self._cloud_instance_id,
+            )
+            return True
+
+        from minitap.mobile_use.clients.cloud_device_factory import (
+            CloudDeviceInstanceConfig,
+            create_cloud_android_instance,
+            create_cloud_ios_instance,
+        )
+
+        cloud_config = self._config.cloud_device_config
+        if cloud_config is None:
+            raise ValueError("Cloud device config is not set and no controller was provided")
+
+        logger.info(f"Provisioning cloud {cloud_config.platform.value} device...")
+
+        instance_config = CloudDeviceInstanceConfig(
+            api_key=cloud_config.api_key,
+            base_url=cloud_config.base_url,
+            inactivity_timeout=cloud_config.inactivity_timeout,
+            hard_timeout=cloud_config.hard_timeout,
+            display_name=cloud_config.display_name,
+            labels=cloud_config.labels,
+        )
+
+        if cloud_config.platform == CloudDevicePlatform.ANDROID:
+            instance, controller = await create_cloud_android_instance(instance_config)
+            self._cloud_instance_id = instance.metadata.id
+            self._cloud_controller = controller
+            try:
+                await controller.connect()
+            except Exception:
+                await self._cleanup_cloud_device()
+                raise
+
+            self._adb_client = controller._adb_client
+            self._ui_adb_client = controller._ui_client
+            self._ios_client = None
+            self._ios_device_type = None
+
+            self._device_context = DeviceContext(
+                host_platform="LINUX",
+                mobile_platform=DevicePlatform.ANDROID,
+                device_id=controller._adb_serial or self._cloud_instance_id,
+                device_width=controller.device_width,
+                device_height=controller.device_height,
+            )
+        else:
+            instance, controller, cloud_controller = await create_cloud_ios_instance(
+                instance_config
+            )
+            self._cloud_instance_id = instance.metadata.id
+            self._cloud_controller = cloud_controller
+
+            self._adb_client = None
+            self._ui_adb_client = None
+            self._ios_client = controller.ios_client
+            self._ios_device_type = DeviceType.CLOUD
+
+            self._device_context = DeviceContext(
+                host_platform="LINUX",
+                mobile_platform=DevicePlatform.IOS,
+                device_id=self._cloud_instance_id,
+                device_width=controller.device_width,
+                device_height=controller.device_height,
+            )
+
+        logger.info(f"Cloud {cloud_config.platform.value} device ready: {self._cloud_instance_id}")
+        logger.info(self._device_context.to_str())
+        logger.info("✅ Mobile-use agent initialized with a cloud device.")
+        self._initialized = True
+        telemetry.capture_agent_initialized(
+            platform=cloud_config.platform.value,
+            device_id=self._cloud_instance_id,
+        )
+        return True
+
+    async def _cleanup_cloud_device(self) -> None:
+        """Clean up cloud device resources."""
+        from minitap.mobile_use.clients.cloud_device_factory import (
+            CloudDeviceInstanceConfig,
+            delete_cloud_android_instance,
+            delete_cloud_ios_instance,
+        )
+
+        if self._cloud_controller:
+            logger.info("Cleaning up cloud device controller...")
+            await self._cloud_controller.cleanup()
+            self._cloud_controller = None
+
+        if self._config.cloud_device_config and self._cloud_instance_id:
+            logger.info(f"Deleting cloud device instance: {self._cloud_instance_id}")
+            cloud_config = self._config.cloud_device_config
+            instance_config = CloudDeviceInstanceConfig(
+                api_key=cloud_config.api_key,
+                base_url=cloud_config.base_url,
+            )
+
+            try:
+                if cloud_config.platform == CloudDevicePlatform.ANDROID:
+                    await delete_cloud_android_instance(instance_config, self._cloud_instance_id)
+                else:
+                    await delete_cloud_ios_instance(instance_config, self._cloud_instance_id)
+            except Exception as e:
+                logger.warning(f"Failed to delete cloud device instance: {e}")
+        elif self._cloud_instance_id:
+            logger.info(
+                "Skipping cloud device deletion because no provisioning config is available: "
+                f"{self._cloud_instance_id}"
+            )
+
+        self._cloud_instance_id = None
+
+    async def _prepare_app_installation(self, task: Task) -> str | None:
+        """Install app if app_path is specified in the task request.
+
+        Returns:
+            The bundle ID of the installed app (iOS only), or None.
+        """
+        if not task.request.app_path:
+            return None
+
+        task_name = task.get_name()
+        logger.info(f"[{task_name}] Installing app from: {task.request.app_path}")
+
+        bundle_id = await self.install_app(task.request.app_path)
+
+        if bundle_id:
+            logger.info(f"[{task_name}] App installed with bundle ID: {bundle_id}")
+            # If locked_app_package is not set, automatically lock to the installed app
+            if not task.request.locked_app_package:
+                logger.info(f"[{task_name}] Auto-locking to installed app: {bundle_id}")
+                task.request.locked_app_package = bundle_id
+
+        return bundle_id
+
+    async def _prepare_app_lock(self, task: Task, context: MobileUseContext):
+        """Prepare app lock by launching the locked app if specified."""
+        if not task.request.locked_app_package:
+            return
+
+        task_name = task.get_name()
+        logger.info(f"[{task_name}] Preparing app lock for: {task.request.locked_app_package}")
+
+        app_lock_status = await _handle_initial_app_launch(
+            ctx=context, locked_app_package=task.request.locked_app_package
+        )
+
+        if context.execution_setup is None:
+            context.execution_setup = ExecutionSetup(app_lock_status=app_lock_status)
+        else:
+            context.execution_setup.app_lock_status = app_lock_status
+
+        if app_lock_status.locked_app_initial_launch_success is False:
+            error = app_lock_status.locked_app_initial_launch_error
+            logger.warning(f"[{task_name}] Failed to launch locked app: {error}")
+
     def _prepare_tracing(self, task: Task, context: MobileUseContext):
+        """Prepare tracing setup if record_trace is enabled."""
         if not task.request.record_trace:
             return
+
         task_name = task.get_name()
         temp_trace_path = Path(self._tmp_traces_dir / task_name).resolve()
         traces_output_path = Path(task.request.trace_path).resolve()
@@ -354,21 +1127,26 @@ class Agent:
         logger.info(f"[{task_name}] 📄📂 Traces temp path: {temp_trace_path}")
         traces_output_path.mkdir(parents=True, exist_ok=True)
         temp_trace_path.mkdir(parents=True, exist_ok=True)
+
         context.execution_setup = ExecutionSetup(
-            traces_path=self._tmp_traces_dir, trace_id=task_name
+            traces_path=self._tmp_traces_dir,
+            trace_name=task_name,
         )
 
-    def _finalize_tracing(self, task: Task, context: MobileUseContext):
+    async def _finalize_tracing(self, task: Task, context: MobileUseContext):
         exec_setup_ctx = context.execution_setup
         if not exec_setup_ctx:
             return
 
-        task_name = task.get_name()
-        status = "_PASS" if task.status == TaskStatus.COMPLETED else "_FAIL"
-        ts = task.created_at.strftime("%Y-%m-%dT%H-%M-%S")
-        new_name = f"{exec_setup_ctx.trace_id}{status}_{ts}"
+        if exec_setup_ctx.traces_path is None or exec_setup_ctx.trace_name is None:
+            return
 
-        temp_trace_path = (self._tmp_traces_dir / exec_setup_ctx.trace_id).resolve()
+        task_name = task.get_name()
+        status = "_PASS" if task.status == "completed" else "_FAIL"
+        ts = task.created_at.strftime("%Y-%m-%dT%H-%M-%S")
+        new_name = f"{exec_setup_ctx.trace_name}{status}_{ts}"
+
+        temp_trace_path = (self._tmp_traces_dir / exec_setup_ctx.trace_name).resolve()
         traces_output_path = Path(task.request.trace_path).resolve()
 
         logger.info(f"[{task_name}] Compiling trace FROM FOLDER: " + str(temp_trace_path))
@@ -426,7 +1204,7 @@ class Agent:
             initial_goal=task.request.goal,
             subgoal_plan=[],
             latest_ui_hierarchy=None,
-            latest_screenshot_base64=None,
+            latest_screenshot=None,
             focused_app_info=None,
             device_date=None,
             structured_decisions=None,
@@ -435,84 +1213,70 @@ class Agent:
             remaining_steps=task.request.max_steps,
             executor_messages=[],
             cortex_last_thought=None,
+            scratchpad={},
         )
 
-    def _init_clients(self, platform: DevicePlatform, retry_count: int, retry_wait_seconds: int):
+    def _init_clients(
+        self,
+        device_id: str,
+        platform: DevicePlatform,
+        ios_device_type: DeviceType | None,
+        retry_count: int,
+        retry_wait_seconds: int,
+    ):
         self._adb_client = (
             AdbClient(host=self._config.servers.adb_host, port=self._config.servers.adb_port)
             if platform == DevicePlatform.ANDROID
             else None
         )
-        self._hw_bridge_client = DeviceHardwareClient(
-            base_url=self._config.servers.hw_bridge_base_url.to_url(),
+        self._ui_adb_client = (
+            UIAutomatorClient(device_id=device_id) if platform == DevicePlatform.ANDROID else None
         )
-        self._screen_api_client = ScreenApiClient(
-            base_url=self._config.servers.screen_api_base_url.to_url(),
-            retry_count=retry_count,
-            retry_wait_seconds=retry_wait_seconds,
-        )
+
+        # Initialize iOS client using factory (auto-detects device type if not provided)
+        if platform == DevicePlatform.IOS:
+            self._ios_client = get_ios_client(
+                udid=device_id,
+                config=self._config.ios_client_config,
+            )
+            self._ios_device_type = ios_device_type or (
+                DeviceType.PHYSICAL
+                if isinstance(self._ios_client, WdaClientWrapper)
+                else DeviceType.SIMULATOR
+            )
+        else:
+            self._ios_client = None
+            self._ios_device_type = None
 
     def _run_servers(self, device_id: str, platform: DevicePlatform) -> bool:
-        if self._is_default_hw_bridge:
-            bridge_instance = start_device_hardware_bridge(device_id=device_id, platform=platform)
-            if not bridge_instance:
-                logger.warning("Failed to start Device Hardware Bridge.")
-                return False
-
-            logger.info("Waiting for Device Hardware Bridge to connect to a device...")
-            while True:
-                status_info = bridge_instance.get_status()
-                status = status_info.get("status")
-                output = status_info.get("output")
-
-                if status == BridgeStatus.RUNNING.value:
-                    logger.success(
-                        "Device Hardware Bridge is running. "
-                        + f"Connected to device: {device_id} [{platform.value}]"
-                    )
-                    break
-
-                failed_statuses = [
-                    BridgeStatus.NO_DEVICE.value,
-                    BridgeStatus.FAILED.value,
-                    BridgeStatus.PORT_IN_USE.value,
-                    BridgeStatus.STOPPED.value,
-                ]
-                if status in failed_statuses:
-                    logger.error(
-                        f"Device Hardware Bridge failed to connect. "
-                        f"Status: {status} - Output: {output}"
-                    )
-                    return False
-
-                time.sleep(1)
-
-        # Start Device Screen API if not already running
-        if self._is_default_screen_api:
-            api_process = start_device_screen_api(use_process=True)
-            if not api_process:
-                logger.error("Failed to start Device Screen API. Exiting.")
-                return False
-
-        # Check API health
-        if not self._check_device_screen_api_health():
-            logger.error("Device Screen API health check failed. Stopping...")
-            return False
+        if platform == DevicePlatform.ANDROID:
+            if not self._ui_adb_client:
+                error_msg = (
+                    "UIAutomator client is required for Android but not available. "
+                    "Please ensure UIAutomator2 is properly installed and configured."
+                )
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+            logger.info("✓ UIAutomator client available for Android")
+        elif platform == DevicePlatform.IOS:
+            if not self._ios_client:
+                error_msg = (
+                    "iOS client is required but not available. "
+                    "Ensure idb (simulators) or WDA (physical) is available."
+                )
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+            if isinstance(self._ios_client, WdaClientWrapper):
+                client_type = "WDA"
+            elif isinstance(self._ios_client, BrowserStackClientWrapper):
+                client_type = "BrowserStack"
+            else:
+                client_type = "IDB"
+            logger.info(f"✓ iOS client available ({client_type})")
 
         return True
 
-    def _check_device_screen_api_health(self) -> bool:
-        try:
-            # Required to know if the Screen API is up
-            self._screen_api_client.get_with_retry("/health", timeout=5)
-            # Required to know if the Screen API actually receives screenshot from the HW Bridge API
-            self._screen_api_client.get_with_retry("/screen-info", timeout=5)
-            return True
-        except Exception as e:
-            logger.error(f"Device Screen API health check failed: {e}")
-            return False
-
-    def _get_device_context(
+    async def _get_device_context(
         self,
         device_id: str,
         platform: DevicePlatform,
@@ -520,13 +1284,52 @@ class Agent:
         from platform import system
 
         host_platform = system()
-        screen_data: ScreenDataResponse = get_screen_data(self._screen_api_client)
+
+        # Get real device dimensions from the device
+        if platform == DevicePlatform.ANDROID:
+            if self._ui_adb_client:
+                try:
+                    # Use UIAutomator to get actual screen dimensions
+                    screen_data = self._ui_adb_client.get_screen_data()
+                    device_width = screen_data.width
+                    device_height = screen_data.height
+                    logger.info(
+                        f"Retrieved Android screen dimensions: {device_width}x{device_height}"
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to get Android screen dimensions: {e}, using defaults")
+                    device_width, device_height = 1080, 2340
+            else:
+                logger.warning("UIAutomator client not available, using default dimensions")
+                device_width, device_height = 1080, 2340
+        else:  # iOS
+            if self._ios_client:
+                try:
+                    # Use iOS client to take a screenshot and get dimensions
+                    screenshot_data = await self._ios_client.screenshot()  # type: ignore[call-arg]
+                    if screenshot_data:
+                        img = Image.open(BytesIO(screenshot_data))
+                        device_width = img.width
+                        device_height = img.height
+                        logger.info(
+                            f"Retrieved iOS screen dimensions: {device_width}x{device_height}"
+                        )
+                    else:
+                        logger.warning("IDB screenshot returned None, using default dimensions")
+                        device_width, device_height = 375, 812
+                except Exception as e:
+                    logger.warning(f"Failed to get iOS screen dimensions: {e}, using defaults")
+                    device_width, device_height = 375, 812
+            else:
+                logger.warning("IDB client not available, using default dimensions")
+                device_width, device_height = 375, 812
+
         return DeviceContext(
             host_platform="WINDOWS" if host_platform == "Windows" else "LINUX",
             mobile_platform=platform,
             device_id=device_id,
-            device_width=screen_data.width,
-            device_height=screen_data.height,
+            device_width=device_width,
+            device_height=device_height,
         )
 
 

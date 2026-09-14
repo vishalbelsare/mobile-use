@@ -1,6 +1,6 @@
 [project]
 name = "minitap-mobile-use"
-version = "2.2.0"
+version = "4.0.0"
 description = "AI-powered multi-agent system that automates real Android and iOS devices through low-level control using LangGraph."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -14,32 +14,44 @@ authors = [
 requires-python = ">=3.12"
 
 dependencies = [
-    "langgraph>=0.6.6",
+    "langgraph>=1.0.2,<2.0.0",
     "adbutils==2.9.3",
-    "langchain-google-genai>=2.1.10",
-    "langchain>=0.3.27",
-    "langchain-core>=0.3.75",
+    "langchain-google-genai>=4.0.0",
+    "langchain>=1.0.0",
+    "langchain-core>=1.0.0",
     "jinja2==3.1.6",
     "python-dotenv==1.1.1",
     "pydantic-settings==2.10.1",
-    "langchain-mcp-adapters==0.1.7",
-    "langchain-openai==0.3.27",
+    "langchain-mcp-adapters>=0.2.0",
+    "langchain-anthropic>=1.0.0",
+    "langchain-openai>=1.0.0",
     "typer==0.16.0",
-    "langchain-cerebras>=0.5.0",
+    "langchain-cerebras>=0.8.0",
     "inquirer>=3.4.0",
-    "sseclient-py==1.8.0",
-    "fastapi==0.111.0",
-    "uvicorn[standard]==0.30.1",
+    "sseclient-py>=1.8.0",
+    "fastapi>=0.111.0",
+    "uvicorn[standard]>=0.30.1",
     "colorama>=0.4.6",
     "psutil>=5.9.0",
-    "langchain-google-vertexai>=2.0.28",
+    "langchain-google-vertexai>=3.0.0",
+    "httpx>=0.28.1",
+    "uiautomator2>=3.5.0",
+    "fb-idb>=1.1.7",
+    "facebook-wda>=1.5.4",
+    "Appium-Python-Client>=5.0.0",
+    "posthog>=7.4.2",
+    "uuid-utils>=0.12.0",
+    "limrun-api>=0.1.0",
+    "websockets>=12.0",
+    "langchain-azure-ai>=1.1.1",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "ruff==0.5.3",
-    "pytest==8.4.1",
-    "pytest-cov==5.0.0"
+    "ruff>=0.15.2",
+    "pytest>=8.4.1",
+    "pytest-cov>=5.0.0",
+    "pyright>=1.1.405"
 ]
 
 [project.scripts]
@@ -122,3 +134,48 @@ skip-magic-trailing-comma = false
 
 # Like Black, automatically detect the appropriate line ending.
 line-ending = "auto"
+
+[tool.pytest.ini_options]
+# Add project root to Python path for absolute imports
+pythonpath = [
+    "."
+]
+# Specify test discovery patterns
+testpaths = [
+    "minitap",
+    "tests"
+]
+python_files = [
+    "*.test.py",
+    "test_*.py",
+    "*_test.py"
+]
+python_functions = [
+    "test_*"
+]
+python_classes = [
+    "Test*"
+]
+# Add useful options
+addopts = [
+    "-v",                    # verbose output
+    "--tb=short",           # shorter traceback format
+    "--strict-markers",     # strict marker checking
+    "--disable-warnings",   # disable warnings for cleaner output
+]
+
+markers = [
+    "ios_simulator: tests requiring iOS simulator (run on macOS with IDB)",
+    "android: tests requiring Android device or emulator",
+    "integration: tests making real external API calls (require provider credentials)",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.2",
+    "pytest>=8.4.1",
+    "pytest-asyncio>=1.2.0",
+    "pytest-cov>=5.0.0",
+    "pyright>=1.1.389",
+    "pre-commit>=3.5.0",
+]

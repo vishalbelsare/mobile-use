@@ -11,6 +11,11 @@
 [![Discord](https://img.shields.io/discord/1403058278342201394?color=7289DA&label=Discord&logo=discord&logoColor=white&style=for-the-badge)](https://discord.gg/6nSqmQ9pQs)
 [![GitHub stars](https://img.shields.io/github/stars/minitap-ai/mobile-use?style=for-the-badge&color=e0a8dd)](https://github.com/minitap-ai/mobile-use/stargazers)
 
+<h3>
+    <a href="https://docs.minitap.ai/v2/mcp-server/introduction"><b>📚 Documentation</b></a> •
+    <a href="https://arxiv.org/abs/2602.07787"><b>📃 Paper</b></a>
+
+</h3>
 <p align="center">
     <a href="https://discord.gg/6nSqmQ9pQs"><b>Discord</b></a> •
     <a href="https://x.com/minitap_ai?t=iRWtI497UhRGLeCKYQekig&s=09"><b>Twitter / X</b></a>
@@ -18,7 +23,7 @@
 
 [![PyPI version](https://img.shields.io/pypi/v/minitap-mobile-use.svg?color=blue)](https://pypi.org/project/minitap-mobile-use/)
 [![Python Version](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org/downloads/)
-[![License](https://img.shields.io/badge/license-MIT-blue)](https://github.com/minitap-ai/mobile-use/blob/main/LICENSE)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](https://github.com/minitap-ai/mobile-use/blob/main/LICENSE)
 
 </div>
 
@@ -29,25 +34,33 @@ Mobile-use is a powerful, open-source AI agent that controls your Android or IOS
 ## ✨ Features
 
 - 🗣️ **Natural Language Control**: Interact with your phone using your native language.
-- 📱 **UI-Aware Automation**: Intelligently navigates through app interfaces.
+- 📱 **UI-Aware Automation**: Intelligently navigates through app interfaces (note: currently has limited effectiveness with games as they don't provide accessibility tree data).
 - 📊 **Data Scraping**: Extract information from any app and structure it into your desired format (e.g., JSON) using a natural language description.
-- 🔧 **Extensible & Customizable**: Easily configure different LLMs to power the agents that power mobile-use.
+- 🔧 **Extensible & Customizable**: Easily configure different LLMs to power the agents that power mobile-use. Supports OpenAI, Google, xAI, OpenRouter, MiniMax, and more.
 
 ## Benchmarks
 
 <p align="center">
-  <img src="./doc/benchmark.jpg" alt="Project banner" />
+  <a href="https://minitap.ai/benchmark">
+    <img src="https://files.peachworlds.com/website/2b590171-669d-42ce-b4b5-ce6eae83a9d8/scorerank-140126.webp" alt="Project banner" />
+  </a>
 </p>
 
-We are global number 1 Opensource pass@1 on the AndroidWorld benchmark.
+We stand as the top performers and the first to have completed 100% of the AndroidWorld benchmark.
 
-More info here: https://minitap.ai/research/mobile-ai-agents-benchmark
+Get more info about how we reached this milestone here: [Minitap Benchmark](https://minitap.ai/benchmark).
 
-The official leaderboard is available [here](https://docs.google.com/spreadsheets/d/1cchzP9dlTZ3WXQTfYNhh3avxoLipqHN75v1Tb86uhHo/edit?pli=1&gid=0#gid=0)
+The official leaderboard is available [here](https://docs.google.com/spreadsheets/d/1cchzP9dlTZ3WXQTfYNhh3avxoLipqHN75v1Tb86uhHo/edit?pli=1&gid=0#gid=0).
+
+Check out our research paper [here](https://arxiv.org/abs/2602.07787).
 
 ## 🚀 Getting Started
 
 Ready to automate your mobile experience? Follow these steps to get mobile-use up and running.
+
+### 🛠️ Run locally
+
+Mobile-use runs on your own Android or iOS device with your choice of supported LLM provider. Start with the [local quickstart](https://docs.minitap.ai/mobile-use-sdk/quickstart).
 
 1.  **Set up Environment Variables:**
     Copy the example `.env.example` file to `.env` and add your API keys.
@@ -70,7 +83,25 @@ Ready to automate your mobile experience? Follow these steps to get mobile-use u
     1. Set `OPENAI_BASE_URL` and `OPENAI_API_KEY` in your `.env`
     2. In your `llm-config.override.jsonc`, set `openai` as the provider for the agent nodes you want, and choose a model supported by your provider.
 
-    > [!NOTE]  
+    **Using MiniMax:**
+
+    [MiniMax](https://www.minimaxi.com/) provides high-performance, OpenAI-compatible LLMs for agentic and coding tasks. To use MiniMax as your provider:
+
+    1. Set `MINIMAX_API_KEY` in your `.env`
+    2. Copy the contents of the `minimax` preset object from `llm-config.defaults.jsonc` into your `llm-config.override.jsonc`, or set `"provider": "minimax"` on individual agent nodes.
+
+    Available models: `MiniMax-M2.7` (200K context, recommended), `MiniMax-M2.7-highspeed` (200K context, faster inference).
+
+    **Using Anthropic Claude:**
+
+    [Anthropic](https://www.anthropic.com/) provides Claude — a capable, safety-focused model family. To use it:
+
+    1. Set `ANTHROPIC_API_KEY` in your `.env`
+    2. Copy the contents of the `anthropic` preset object from `llm-config.defaults.jsonc` into your `llm-config.override.jsonc`, or set `"provider": "anthropic"` on individual agent nodes.
+
+    Available models: `claude-sonnet-4-6` (200K context, recommended), `claude-haiku-4-5-20251001` (200K context, faster/cheaper).
+
+    > [!NOTE]
     > If you want to use Google Vertex AI, you must either:
     >
     > - Have credentials configured for your environment (gcloud, workload identity, etc…)
@@ -80,7 +111,7 @@ Ready to automate your mobile experience? Follow these steps to get mobile-use u
 
 ### Quick Launch (Docker)
 
-> [!NOTE]  
+> [!NOTE]
 > This quickstart, is only available for Android devices/emulators as of now, and you must have Docker installed.
 
 First:
@@ -88,17 +119,13 @@ First:
 - Either plug your Android device and enable USB-debugging via the Developer Options
 - Or launch an Android emulator
 
-> [!IMPORTANT]  
-> At some point, the terminal will HANG, and Maestro will ask you `Maestro CLI would like to collect anonymous usage data to improve the product.`
-> It's up to you whether you accept (i.e enter 'Y') or not (i.e. enter 'n').
-
 Then run in your terminal:
 
 1. For Linux/macOS:
 
 ```bash
 chmod +x mobile-use.sh
-./mobile-use.sh \
+bash ./mobile-use.sh \
   "Open Gmail, find first 3 unread emails, and list their sender and subject line" \
   --output-description "A JSON list of objects, each with 'sender' and 'subject' keys"
 ```
@@ -111,13 +138,12 @@ powershell.exe -ExecutionPolicy Bypass -File mobile-use.ps1 `
   --output-description "A JSON list of objects, each with 'sender' and 'subject' keys"
 ```
 
-> [!NOTE]  
+> [!NOTE]
 > If using your own device, make sure to accept the ADB-related connection requests that will pop up on your device.
-> Similarly, Maestro will need to install its APK on your device, which will also require you to accept the installation request.
 
 #### 🧰 Troubleshooting
 
-The script will try to connect to your device via IP.  
+The script will try to connect to your device via IP.
 Therefore, your device **must be connected to the same Wi-Fi network as your computer**.
 
 ##### 1. No device IP found
@@ -128,7 +154,7 @@ If the script fails with the following message:
 Could not get device IP. Is a device connected via USB and on the same Wi-Fi network?
 ```
 
-Then it couldn't find one of the common Wi-Fi interfaces on your device.  
+Then it couldn't find one of the common Wi-Fi interfaces on your device.
 Therefore, you must determine what WLAN interface your phone is using via `adb shell ip addr show up`.
 Then add the `--interface <YOUR_INTERFACE_NAME>` option to the script.
 
@@ -138,7 +164,7 @@ This is most probably an issue with your firewall blocking the connection. There
 
 ##### 3. Failed to pull GHCR docker images (unauthorized)
 
-Since UV docker images rely on a `ghcr.io` public repositories, you may have an expired token if you used `ghcr.io` before for private repositories.  
+Since UV docker images rely on a `ghcr.io` public repositories, you may have an expired token if you used `ghcr.io` before for private repositories.
 Try running `docker logout ghcr.io` and then run the script again.
 
 ### Manual Launch (Development Mode)
@@ -153,23 +179,34 @@ Mobile-use currently supports the following devices:
 - **Android Simulators**: Set up through Android Studio.
 - **iOS Simulators**: Supported for macOS users.
 
-> [!NOTE]  
+> [!NOTE]
 > Physical iOS devices are not yet supported.
 
 #### 2. Prerequisites
 
-For Android:
+**For Android:**
 
 - **[Android Debug Bridge (ADB)](https://developer.android.com/studio/releases/platform-tools)**: A tool to connect to your device.
 
-For iOS:
+**For iOS (macOS only):**
 
 - **[Xcode](https://developer.apple.com/xcode/)**: Apple's IDE for iOS development.
+- **[fb-idb](https://fbidb.io/docs/installation/)**: Facebook's iOS Development Bridge for device automation.
+
+  ```bash
+  # Install via Homebrew (macOS)
+  brew tap facebook/fb
+  brew install idb-companion
+  ```
+
+  > [!NOTE]
+  > `idb_companion` is required to communicate with iOS simulators. Make sure it's in your PATH after installation.
+
+**Common requirements:**
 
 Before you begin, ensure you have the following installed:
 
 - **[uv](https://github.com/astral-sh/uv)**: A lightning-fast Python package manager.
-- **[Maestro](https://maestro.mobile.dev/getting-started/installing-maestro)**: The framework we use to interact with your device.
 
 #### 3. Installation
 
@@ -207,7 +244,7 @@ To run mobile-use, simply pass your command as an argument.
 **Example 1: Basic Command**
 
 ```bash
-python ./src/mobile_use/main.py "Go to settings and tell me my current battery level"
+python ./minitap/mobile_use/main.py "Go to settings and tell me my current battery level"
 ```
 
 **Example 2: Data Scraping**
@@ -215,12 +252,12 @@ python ./src/mobile_use/main.py "Go to settings and tell me my current battery l
 Extract specific information and get it back in a structured format. For instance, to get a list of your unread emails:
 
 ```bash
-python ./src/mobile_use/main.py \
+python ./minitap/mobile_use/main.py \
   "Open Gmail, find all unread emails, and list their sender and subject line" \
   --output-description "A JSON list of objects, each with 'sender' and 'subject' keys"
 ```
 
-> [!NOTE]  
+> [!NOTE]
 > If you haven't configured a specific model, mobile-use will prompt you to choose one from the available options.
 
 ## 🔎 Agentic System Overview
@@ -240,11 +277,37 @@ We love contributions! Whether you're fixing a bug, adding a feature, or improvi
 ## ⭐ Star History
 
 <p align="center">
-  <a href="https://star-history.com/#minitap-ai/mobile-use&Date">
-    <img src="https://api.star-history.com/svg?repos=minitap-ai/mobile-use&type=Date" alt="Star History Chart" />
+  <a href="https://star-history.dera.page/#minitap-ai/mobile-use&Date">
+    <img src="https://star-history.dera.page/svg?repos=minitap-ai/mobile-use&type=Date" alt="Star History Chart" />
   </a>
 </p>
 
-## 📜 License
+## 🏆 Attribution & Licensing
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+`mobile-use` is the first agentic framework to achieve **100% on the AndroidWorld benchmark**.
+
+This project is licensed under the **Apache License 2.0**.
+
+If you use this code, or are inspired by the architecture used to reach our benchmark results, we kindly request that you credit Minitap, Inc.
+
+### How to Cite
+If you use this work in research or a commercial product, please use the following:
+> Pierre-Louis Favreau, Jean-Pierre Lo, Clement Guiguet, Charles Simon-Meunier,  
+Nicolas Dehandschoewercker, Allen G. Roush, Judah Goldfeder, Ravid Shwartz-Ziv.  
+_Do Multi-Agents Dream of Electric Screens? Achieving Perfect Accuracy on AndroidWorld Through Task Decomposition._  
+arXiv preprint arXiv:2602.07787 (2026).  
+https://arxiv.org/abs/2602.07787
+
+#### Bibtex
+
+
+```bibtex
+@misc{favreau2026multiagentsdreamelectricscreens,
+  title        = {Do Multi-Agents Dream of Electric Screens? Achieving Perfect Accuracy on AndroidWorld Through Task Decomposition},
+  author       = {Pierre-Louis Favreau and Jean-Pierre Lo and Clement Guiguet and Charles Simon-Meunier and Nicolas Dehandschoewercker and Allen G. Roush and Judah Goldfeder and Ravid Shwartz-Ziv},
+  year         = {2026},
+  eprint       = {2602.07787},
+  archivePrefix= {arXiv},
+  primaryClass = {cs.AI},
+  url          = {https://arxiv.org/abs/2602.07787}
+}

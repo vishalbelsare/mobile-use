@@ -1,8 +1,9 @@
 import sys
 
-from minitap.mobile_use.clients.ios_client import get_ios_devices
 from adbutils import AdbClient
 from rich.console import Console
+
+from minitap.mobile_use.clients.ios_client import format_device_info, get_all_ios_devices_detailed
 
 
 def display_device_status(console: Console, adb_client: AdbClient | None = None):
@@ -17,23 +18,20 @@ def display_device_status(console: Console, adb_client: AdbClient | None = None)
             console.print(f"  - {device.serial}")
     else:
         console.print("❌ [bold red]No Android device found.[/bold red]")
-        console.print("Please make sure your emulator is running or a device is connected via USB.")
         command = "emulator -avd <avd_name>"
         if sys.platform not in ["win32", "darwin"]:
             command = f"./{command}"
-        console.print(f"You can start an emulator using a command like: [bold]'{command}'[/bold]")
-        console.print("[italic]iOS detection coming soon...[/italic]")
-
-    xcrun_available, ios_devices, error_message = get_ios_devices()
-    if xcrun_available:
-        if ios_devices:
-            console.print("✅ [bold green]iOS device(s) connected:[/bold green]")
-            for device in ios_devices:
-                console.print(f"  - {device}")
-        else:
-            console.print("❌ [bold red]No iOS device found.[/bold red]")
             console.print(
-                "[iOS] Please make sure your emulator is running or a device is connected via USB."
+                f"You can start an emulator using a command like: [bold]'{command}'[/bold]"
             )
-        return
-    console.print(f"❌ [bold red]iOS check failed:[/bold red] {error_message}")
+
+    ios_devices = get_all_ios_devices_detailed()
+    if ios_devices:
+        console.print("✅ [bold green]iOS device(s) connected:[/bold green]")
+        for device in ios_devices:
+            console.print(f"  - [green]{format_device_info(device)}[/green]")
+    else:
+        console.print("❌ [bold red]No iOS device found.[/bold red]")
+        console.print(
+            "[iOS] Please make sure your emulator is running or a device is connected via USB."
+        )

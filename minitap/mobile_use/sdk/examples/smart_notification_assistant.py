@@ -19,9 +19,10 @@ Run:
 
 import asyncio
 from datetime import datetime
-from enum import Enum
+from enum import StrEnum
 
 from pydantic import BaseModel, Field
+
 from minitap.mobile_use.config import LLM, LLMConfig, LLMConfigUtils, LLMWithFallback
 from minitap.mobile_use.sdk import Agent
 from minitap.mobile_use.sdk.builders import Builders
@@ -29,7 +30,7 @@ from minitap.mobile_use.sdk.types import AgentProfile
 from minitap.mobile_use.sdk.types.exceptions import AgentError
 
 
-class NotificationPriority(str, Enum):
+class NotificationPriority(StrEnum):
     HIGH = "high"
     MEDIUM = "medium"
     LOW = "low"
@@ -62,17 +63,42 @@ def get_agent() -> Agent:
     analyzer_profile = AgentProfile(
         name="analyzer",
         llm_config=LLMConfig(
-            planner=LLM(provider="openrouter", model="meta-llama/llama-4-scout"),
-            orchestrator=LLM(provider="openrouter", model="meta-llama/llama-4-scout"),
+            planner=LLMWithFallback(
+                provider="openrouter",
+                model="meta-llama/llama-4-scout",
+                fallback=LLM(provider="openrouter", model="meta-llama/llama-4-maverick"),
+            ),
+            orchestrator=LLMWithFallback(
+                provider="openrouter",
+                model="meta-llama/llama-4-scout",
+                fallback=LLM(provider="openrouter", model="meta-llama/llama-4-maverick"),
+            ),
+            contextor=LLMWithFallback(
+                provider="openrouter",
+                model="meta-llama/llama-4-scout",
+                fallback=LLM(provider="openrouter", model="meta-llama/llama-4-maverick"),
+            ),
             cortex=LLMWithFallback(
                 provider="openai",
                 model="o4-mini",
                 fallback=LLM(provider="openai", model="gpt-5"),
             ),
-            executor=LLM(provider="openai", model="gpt-5-nano"),
+            executor=LLMWithFallback(
+                provider="openai",
+                model="gpt-5-nano",
+                fallback=LLM(provider="openai", model="gpt-5-mini"),
+            ),
             utils=LLMConfigUtils(
-                outputter=LLM(provider="openai", model="gpt-5-nano"),
-                hopper=LLM(provider="openai", model="gpt-4.1"),
+                outputter=LLMWithFallback(
+                    provider="openai",
+                    model="gpt-5-nano",
+                    fallback=LLM(provider="openai", model="gpt-5-mini"),
+                ),
+                hopper=LLMWithFallback(
+                    provider="openai",
+                    model="gpt-5-nano",
+                    fallback=LLM(provider="openai", model="gpt-5-mini"),
+                ),
             ),
         ),
         # from_file="/tmp/analyzer.jsonc"  # can be loaded from file
@@ -82,17 +108,40 @@ def get_agent() -> Agent:
     action_profile = AgentProfile(
         name="note_taker",
         llm_config=LLMConfig(
-            planner=LLM(provider="openai", model="o3"),
-            orchestrator=LLM(provider="google", model="gemini-2.5-flash"),
+            planner=LLMWithFallback(
+                provider="openai", model="o3", fallback=LLM(provider="openai", model="gpt-5")
+            ),
+            orchestrator=LLMWithFallback(
+                provider="google",
+                model="gemini-2.5-flash",
+                fallback=LLM(provider="openai", model="gpt-5"),
+            ),
+            contextor=LLMWithFallback(
+                provider="openai",
+                model="gpt-5-nano",
+                fallback=LLM(provider="openai", model="gpt-5-mini"),
+            ),
             cortex=LLMWithFallback(
                 provider="openai",
                 model="o4-mini",
                 fallback=LLM(provider="openai", model="gpt-5"),
             ),
-            executor=LLM(provider="openai", model="gpt-4o-mini"),
+            executor=LLMWithFallback(
+                provider="openai",
+                model="gpt-4o-mini",
+                fallback=LLM(provider="openai", model="gpt-5-nano"),
+            ),
             utils=LLMConfigUtils(
-                outputter=LLM(provider="openai", model="gpt-5-nano"),
-                hopper=LLM(provider="openai", model="gpt-4.1"),
+                outputter=LLMWithFallback(
+                    provider="openai",
+                    model="gpt-5-nano",
+                    fallback=LLM(provider="openai", model="gpt-5-mini"),
+                ),
+                hopper=LLMWithFallback(
+                    provider="openai",
+                    model="gpt-5-nano",
+                    fallback=LLM(provider="openai", model="gpt-5-mini"),
+                ),
             ),
         ),
     )
@@ -118,7 +167,7 @@ async def main():
 
     try:
         # Initialize agent (finds a device, starts required servers)
-        agent.init()
+        await agent.init()
 
         print("Checking for notifications...")
 
@@ -168,7 +217,7 @@ async def main():
 
     finally:
         # Clean up
-        agent.clean()
+        await agent.clean()
         print(f"\nTraces saved to: {traces_dir}")
 
 

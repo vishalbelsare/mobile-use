@@ -1,13 +1,14 @@
+from typing import Annotated
+
 from langchain_core.messages import AIMessage, AnyMessage
 from langgraph.graph import add_messages
-from langgraph.prebuilt.chat_agent_executor import AgentStatePydantic
-from typing import Annotated
+from pydantic import BaseModel
 
 from minitap.mobile_use.agents.planner.types import Subgoal
 from minitap.mobile_use.config import AgentNode
+from minitap.mobile_use.context import MobileUseContext
 from minitap.mobile_use.utils.logger import get_logger
 from minitap.mobile_use.utils.recorder import record_interaction
-from minitap.mobile_use.context import MobileUseContext
 
 logger = get_logger(__name__)
 
@@ -16,7 +17,15 @@ def take_last(a, b):
     return b
 
 
-class State(AgentStatePydantic):
+def merge_dicts(a, b):
+    """Merge two dicts; keys in b overwrite keys in a."""
+    return {**a, **b}
+
+
+class State(BaseModel):
+    messages: Annotated[list[AnyMessage], "Sequential messages", add_messages]
+    remaining_steps: Annotated[int | None, "Remaining steps before the task is completed"] = None
+
     # planner related keys
     initial_goal: Annotated[str, "Initial goal given by the user"]
 
@@ -24,10 +33,10 @@ class State(AgentStatePydantic):
     subgoal_plan: Annotated[list[Subgoal], "The current plan, made of subgoals"]
 
     # contextor related keys
-    latest_screenshot_base64: Annotated[str | None, "Latest screenshot of the device", take_last]
     latest_ui_hierarchy: Annotated[
         list[dict] | None, "Latest UI hierarchy of the device", take_last
     ]
+    latest_screenshot: Annotated[str | None, "Latest screenshot base64 of the device", take_last]
     focused_app_info: Annotated[str | None, "Focused app info", take_last]
     device_date: Annotated[str | None, "Date of the device", take_last]
 
@@ -54,7 +63,14 @@ class State(AgentStatePydantic):
         take_last,
     ]
 
-    def sanitize_update(
+    # scratchpad for explicit memory
+    scratchpad: Annotated[
+        dict[str, str],
+        "Persistent key-value storage for notes the agent can save and retrieve",
+        merge_dicts,
+    ] = {}
+
+    async def asanitize_update(
         self,
         ctx: MobileUseContext,
         update: dict,
@@ -68,11 +84,14 @@ class State(AgentStatePydantic):
         if updated_agents_thoughts is not None:
             if isinstance(updated_agents_thoughts, str):
                 updated_agents_thoughts = [updated_agents_thoughts]
-            elif not isinstance(updated_agents_thoughts, list):
+            elif isinstance(updated_agents_thoughts, list):
+                updated_agents_thoughts = [t for t in updated_agents_thoughts if t is not None]
+            else:
                 raise ValueError("agents_thoughts must be a str or list[str]")
+
             if agent is None:
                 raise ValueError("Agent is required when updating the 'agents_thoughts' key")
-            update["agents_thoughts"] = _add_agent_thoughts(
+            update["agents_thoughts"] = await _add_agent_thoughts(
                 ctx=ctx,
                 old=self.agents_thoughts,
                 new=updated_agents_thoughts,
@@ -81,13 +100,21 @@ class State(AgentStatePydantic):
         return update
 
 
-def _add_agent_thoughts(
+async def _add_agent_thoughts(
     ctx: MobileUseContext,
     old: list[str],
     new: list[str],
     agent: AgentNode,
 ) -> list[str]:
+    if ctx.on_agent_thought:
+        for thought in new:
+            await ctx.on_agent_thought(agent, thought)
+
     named_thoughts = [f"[{agent}] {thought}" for thought in new]
-    if ctx.execution_setup:
-        record_interaction(ctx, response=AIMessage(content=str(named_thoughts)))
+    if (
+        ctx.execution_setup
+        and ctx.execution_setup.traces_path is not None
+        and ctx.execution_setup.trace_name is not None
+    ):
+        await record_interaction(ctx, response=AIMessage(content=str(named_thoughts)))
     return old + named_thoughts
